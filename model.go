@@ -4,6 +4,7 @@ import (
 	"errors"
 
 	"go.mongodb.org/mongo-driver/mongo"
+	"go.mongodb.org/mongo-driver/v2/bson"
 	"golang.org/x/net/context"
 
 	. "github.com/infrago/base"
@@ -35,12 +36,19 @@ func (model *MongodbModel) First(args ...Any) Map {
 		}
 	}
 
-	var result Map
+	var res bson.M
 
 	ctx := context.Background()
-	err := db.Collection(model.model).FindOne(ctx, query).Decode(&result)
+	err := db.Collection(model.model).FindOne(ctx, query).Decode(&res)
 	if err != nil && !errors.Is(err, mongo.ErrNoDocuments) {
-		model.base.errorHandler("data.entity.find", err, model.name)
+		model.base.errorHandler("data.first.find", err, model.name)
+		return nil
+	}
+
+	//返回值需要处理特殊类型
+	result, err := transform(res)
+	if err != nil {
+		model.base.errorHandler("data.first.transform", err, model.name)
 		return nil
 	}
 
@@ -85,9 +93,16 @@ func (model *MongodbModel) Query(args ...Any) []Map {
 
 	for cursor.Next(ctx) {
 
-		var result Map
-		if err := cursor.Decode(&result); err != nil {
+		var res bson.M
+		if err := cursor.Decode(&res); err != nil {
 			model.base.errorHandler("data.query.decode", err, model.name)
+			return []Map{}
+		}
+
+		//返回值需要处理特殊类型
+		result, err := transform(res)
+		if err != nil {
+			model.base.errorHandler("data.first.transform", err, model.name)
 			return []Map{}
 		}
 

@@ -2,7 +2,6 @@ package data_mongodb
 
 import (
 	"errors"
-	"fmt"
 	"time"
 
 	. "github.com/infrago/base"
@@ -94,8 +93,6 @@ func (table *MongodbTable) Change(item Map, dddd Map) Map {
 	if dddd[INC] != nil {
 		changes["$inc"] = dddd[INC]
 	}
-
-	fmt.Println("changes", changes)
 
 	ctx := context.Background()
 	_, err := db.Collection(table.view).UpdateOne(ctx, querys, changes)

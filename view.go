@@ -77,12 +77,19 @@ func (view *MongodbView) First(args ...Any) Map {
 	opts := options.FindOne()
 	opts.SetSort(sorts) // 设置排序
 
-	var result Map
+	var res bson.M
 
 	ctx := context.Background()
-	err := db.Collection(view.view).FindOne(ctx, query, opts).Decode(&result)
+	err := db.Collection(view.view).FindOne(ctx, query, opts).Decode(&res)
 	if err != nil && !errors.Is(err, mongo.ErrNoDocuments) {
 		view.base.errorHandler("data.first.find", err, view.name)
+		return nil
+	}
+
+	//返回值需要处理特殊类型
+	result, err := transform(res)
+	if err != nil {
+		view.base.errorHandler("data.first.transform", err, view.name)
 		return nil
 	}
 
@@ -144,9 +151,16 @@ func (view *MongodbView) Query(args ...Any) []Map {
 
 	for cursor.Next(ctx) {
 
-		var result Map
-		if err := cursor.Decode(&result); err != nil {
+		var res bson.M
+		if err := cursor.Decode(&res); err != nil {
 			view.base.errorHandler("data.query.decode", err, view.name)
+			return []Map{}
+		}
+
+		//返回值需要处理特殊类型
+		result, err := transform(res)
+		if err != nil {
+			view.base.errorHandler("data.first.transform", err, view.name)
 			return []Map{}
 		}
 
@@ -230,9 +244,16 @@ func (view *MongodbView) Limit(offset, limit Any, args ...Any) (int64, []Map) {
 
 	for cursor.Next(ctx) {
 
-		var result Map
-		if err := cursor.Decode(&result); err != nil {
+		var res bson.M
+		if err := cursor.Decode(&res); err != nil {
 			view.base.errorHandler("data.limit.decode", err, view.name)
+			return 0, []Map{}
+		}
+
+		//返回值需要处理特殊类型
+		result, err := transform(res)
+		if err != nil {
+			view.base.errorHandler("data.first.transform", err, view.name)
 			return 0, []Map{}
 		}
 
@@ -285,12 +306,19 @@ func (view *MongodbView) Entity(id Any) Map {
 		query[view.key] = id
 	}
 
-	var result Map
+	var res bson.M
 
 	ctx := context.Background()
-	err := db.Collection(view.view).FindOne(ctx, query).Decode(&result)
+	err := db.Collection(view.view).FindOne(ctx, query).Decode(&res)
 	if err != nil && !errors.Is(err, mongo.ErrNoDocuments) {
 		view.base.errorHandler("data.entity.find", err, view.name)
+		return nil
+	}
+
+	//返回值需要处理特殊类型
+	result, err := transform(res)
+	if err != nil {
+		view.base.errorHandler("data.first.transform", err, view.name)
 		return nil
 	}
 

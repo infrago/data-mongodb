@@ -31,7 +31,10 @@ type (
 
 // 打开连接
 func (this *MongodbConnect) Open() error {
-	client, err := mongo.Connect(options.Client().ApplyURI("mongodb://localhost:27017"))
+
+	println("url", this.instance.Config.Url)
+
+	client, err := mongo.Connect(options.Client().ApplyURI(this.instance.Config.Url))
 	if err != nil {
 		return err
 	}
