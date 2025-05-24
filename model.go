@@ -40,8 +40,10 @@ func (model *MongodbModel) First(args ...Any) Map {
 
 	ctx := context.Background()
 	err := db.Collection(model.model).FindOne(ctx, query).Decode(&res)
-	if err != nil && !errors.Is(err, mongo.ErrNoDocuments) {
-		model.base.errorHandler("data.first.find", err, model.name)
+	if err != nil {
+		if !errors.Is(err, mongo.ErrNoDocuments) {
+			model.base.errorHandler("data.first.find", err, model.name)
+		}
 		return nil
 	}
 

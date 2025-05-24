@@ -6,8 +6,8 @@ import (
 
 	. "github.com/infrago/base"
 	"github.com/infrago/infra"
+	"go.mongodb.org/mongo-driver/mongo"
 	"go.mongodb.org/mongo-driver/v2/bson"
-	"go.mongodb.org/mongo-driver/v2/mongo"
 	"go.mongodb.org/mongo-driver/v2/mongo/options"
 )
 
@@ -30,11 +30,26 @@ func (view *MongodbView) Count(args ...Any) float64 {
 
 	db := view.base.connect.client.Database(view.base.schema)
 
-	query := Map{}
-	if len(args) > 0 {
-		if vv, ok := args[0].(Map); ok {
-			query = vv
+	querys := []Map{}
+	for _, arg := range args {
+		if vvs, ok := arg.(Map); ok {
+			query := Map{}
+			for k, v := range vvs {
+				if v == ASC {
+				} else if v == DESC {
+				} else {
+					//默认
+					query[k] = v
+				}
+			}
+			if len(query) > 0 {
+				querys = append(querys, query)
+			}
 		}
+	}
+	query := Map{}
+	if len(querys) > 0 {
+		query["$or"] = querys
 	}
 
 	ctx := context.Background()
@@ -54,24 +69,29 @@ func (view *MongodbView) First(args ...Any) Map {
 
 	db := view.base.connect.client.Database(view.base.schema)
 
-	query := Map{}
-	if len(args) > 0 {
-		if vv, ok := args[0].(Map); ok {
-			query = vv
+	querys := []Map{}
+	sorts := bson.D{}
+	for _, arg := range args {
+		if vvs, ok := arg.(Map); ok {
+			query := Map{}
+			for k, v := range vvs {
+				if v == ASC {
+					sorts = append(sorts, bson.E{k, 1})
+				} else if v == DESC {
+					sorts = append(sorts, bson.E{k, -1})
+				} else {
+					//默认
+					query[k] = v
+				}
+			}
+			if len(query) > 0 {
+				querys = append(querys, query)
+			}
 		}
 	}
-
-	sorts := bson.D{}
-	for k, v := range query {
-		if v == ASC {
-			sorts = append(sorts, bson.E{k, 1})
-			delete(query, k)
-		} else if v == DESC {
-			sorts = append(sorts, bson.E{k, -1})
-			delete(query, k)
-		} else {
-			//默认
-		}
+	query := Map{}
+	if len(querys) > 0 {
+		query["$or"] = querys
 	}
 
 	opts := options.FindOne()
@@ -81,8 +101,10 @@ func (view *MongodbView) First(args ...Any) Map {
 
 	ctx := context.Background()
 	err := db.Collection(view.view).FindOne(ctx, query, opts).Decode(&res)
-	if err != nil && !errors.Is(err, mongo.ErrNoDocuments) {
-		view.base.errorHandler("data.first.find", err, view.name)
+	if err != nil {
+		if !errors.Is(err, mongo.ErrNoDocuments) {
+			view.base.errorHandler("data.first.find", err, view.name)
+		}
 		return nil
 	}
 
@@ -116,24 +138,29 @@ func (view *MongodbView) Query(args ...Any) []Map {
 
 	db := view.base.connect.client.Database(view.base.schema)
 
-	query := Map{}
-	if len(args) > 0 {
-		if vv, ok := args[0].(Map); ok {
-			query = vv
+	querys := []Map{}
+	sorts := bson.D{}
+	for _, arg := range args {
+		if vvs, ok := arg.(Map); ok {
+			query := Map{}
+			for k, v := range vvs {
+				if v == ASC {
+					sorts = append(sorts, bson.E{k, 1})
+				} else if v == DESC {
+					sorts = append(sorts, bson.E{k, -1})
+				} else {
+					//默认
+					query[k] = v
+				}
+			}
+			if len(query) > 0 {
+				querys = append(querys, query)
+			}
 		}
 	}
-
-	sorts := bson.D{}
-	for k, v := range query {
-		if v == ASC {
-			sorts = append(sorts, bson.E{k, 1})
-			delete(query, k)
-		} else if v == DESC {
-			sorts = append(sorts, bson.E{k, -1})
-			delete(query, k)
-		} else {
-			//默认
-		}
+	query := Map{}
+	if len(querys) > 0 {
+		query["$or"] = querys
 	}
 
 	opts := options.Find()
@@ -188,24 +215,30 @@ func (view *MongodbView) Limit(offset, limit Any, args ...Any) (int64, []Map) {
 
 	db := view.base.connect.client.Database(view.base.schema)
 
-	query := Map{}
-	if len(args) > 0 {
-		if vv, ok := args[0].(Map); ok {
-			query = vv
+	querys := []Map{}
+	sorts := bson.D{}
+
+	for _, arg := range args {
+		if vvs, ok := arg.(Map); ok {
+			query := Map{}
+			for k, v := range vvs {
+				if v == ASC {
+					sorts = append(sorts, bson.E{k, 1})
+				} else if v == DESC {
+					sorts = append(sorts, bson.E{k, -1})
+				} else {
+					//默认
+					query[k] = v
+				}
+			}
+			if len(query) > 0 {
+				querys = append(querys, query)
+			}
 		}
 	}
-
-	sorts := bson.D{}
-	for k, v := range query {
-		if v == ASC {
-			sorts = append(sorts, bson.E{k, 1})
-			delete(query, k)
-		} else if v == DESC {
-			sorts = append(sorts, bson.E{k, -1})
-			delete(query, k)
-		} else {
-			//默认
-		}
+	query := Map{}
+	if len(querys) > 0 {
+		query["$or"] = querys
 	}
 
 	ctx := context.Background()
@@ -310,8 +343,10 @@ func (view *MongodbView) Entity(id Any) Map {
 
 	ctx := context.Background()
 	err := db.Collection(view.view).FindOne(ctx, query).Decode(&res)
-	if err != nil && !errors.Is(err, mongo.ErrNoDocuments) {
-		view.base.errorHandler("data.entity.find", err, view.name)
+	if err != nil {
+		if !errors.Is(err, mongo.ErrNoDocuments) {
+			view.base.errorHandler("data.first.find", err, view.name)
+		}
 		return nil
 	}
 
