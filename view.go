@@ -4,11 +4,13 @@ import (
 	"context"
 	"errors"
 
-	. "github.com/infrago/base"
-	"github.com/infrago/infra"
 	"go.mongodb.org/mongo-driver/mongo"
 	"go.mongodb.org/mongo-driver/v2/bson"
 	"go.mongodb.org/mongo-driver/v2/mongo/options"
+
+	. "github.com/infrago/base"
+	"github.com/infrago/data"
+	"github.com/infrago/infra"
 )
 
 type (
@@ -132,7 +134,6 @@ func (view *MongodbView) First(args ...Any) Map {
 }
 
 // 查询列表
-// 171015改成*版
 func (view *MongodbView) Query(args ...Any) []Map {
 	view.base.lastError = nil
 
@@ -206,6 +207,103 @@ func (view *MongodbView) Query(args ...Any) []Map {
 	}
 
 	return items
+}
+
+func (view *MongodbView) Range(next data.RangeFunc, args ...Any) Res {
+	return view.LimitRange(0, next, args...)
+}
+
+// 查询列表
+func (view *MongodbView) LimitRange(limit int64, next data.RangeFunc, args ...Any) Res {
+	if next == nil {
+		return infra.Fail
+	}
+	if limit < 0 {
+		return infra.Fail
+	}
+
+	view.base.lastError = nil
+
+	db := view.base.connect.client.Database(view.base.schema)
+
+	querys := []Map{}
+	sorts := bson.D{}
+	for _, arg := range args {
+		if vvs, ok := arg.(Map); ok {
+			query := Map{}
+			for k, v := range vvs {
+				if v == ASC {
+					sorts = append(sorts, bson.E{k, 1})
+				} else if v == DESC {
+					sorts = append(sorts, bson.E{k, -1})
+				} else {
+					//默认
+					query[k] = v
+				}
+			}
+			if len(query) > 0 {
+				querys = append(querys, query)
+			}
+		}
+	}
+	query := Map{}
+	if len(querys) > 0 {
+		query["$or"] = querys
+	}
+
+	opts := options.Find()
+	opts.SetSort(sorts) // 设置排序
+
+	ctx := context.Background()
+	cursor, err := db.Collection(view.view).Find(ctx, query, opts)
+	if err != nil {
+		view.base.errorHandler("data.query", err, view.name)
+		return infra.Fail
+	}
+	defer cursor.Close(ctx)
+
+	// items := []Map{}
+
+	for cursor.Next(ctx) {
+
+		var res bson.M
+		if err := cursor.Decode(&res); err != nil {
+			view.base.errorHandler("data.query.decode", err, view.name)
+			return infra.Fail
+		}
+
+		//返回值需要处理特殊类型
+		result, err := transform(res)
+		if err != nil {
+			view.base.errorHandler("data.first.transform", err, view.name)
+			return infra.Fail
+		}
+
+		var item Map
+		if view.fields != nil && len(view.fields) > 0 {
+			item := Map{}
+			//直接使用err=会有问题，总是不会nil，就解析问题
+			errm := infra.Mapping(view.fields, result, item, false, true)
+			if errm.Fail() {
+				view.base.errorHandler("data.query.mapping", errm, view.name)
+				return nil
+			}
+			result = item
+		}
+
+		if res := next(item); res.Fail() {
+			return res
+		}
+		if limit > 0 {
+			limit--
+			if limit <= 0 {
+				break
+			}
+		}
+
+	}
+
+	return infra.OK
 }
 
 // 分页查询

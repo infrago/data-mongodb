@@ -5,9 +5,11 @@ import (
 
 	"go.mongodb.org/mongo-driver/mongo"
 	"go.mongodb.org/mongo-driver/v2/bson"
+	"go.mongodb.org/mongo-driver/v2/mongo/options"
 	"golang.org/x/net/context"
 
 	. "github.com/infrago/base"
+	"github.com/infrago/data"
 	"github.com/infrago/infra"
 )
 
@@ -124,4 +126,101 @@ func (model *MongodbModel) Query(args ...Any) []Map {
 	}
 
 	return items
+}
+
+func (model *MongodbModel) Range(next data.RangeFunc, args ...Any) Res {
+	return model.LimitRange(0, next, args...)
+}
+
+// 查询列表
+func (model *MongodbModel) LimitRange(limit int64, next data.RangeFunc, args ...Any) Res {
+	if next == nil {
+		return infra.Fail
+	}
+	if limit < 0 {
+		return infra.Fail
+	}
+
+	model.base.lastError = nil
+
+	db := model.base.connect.client.Database(model.base.schema)
+
+	querys := []Map{}
+	sorts := bson.D{}
+	for _, arg := range args {
+		if vvs, ok := arg.(Map); ok {
+			query := Map{}
+			for k, v := range vvs {
+				if v == ASC {
+					sorts = append(sorts, bson.E{k, 1})
+				} else if v == DESC {
+					sorts = append(sorts, bson.E{k, -1})
+				} else {
+					//默认
+					query[k] = v
+				}
+			}
+			if len(query) > 0 {
+				querys = append(querys, query)
+			}
+		}
+	}
+	query := Map{}
+	if len(querys) > 0 {
+		query["$or"] = querys
+	}
+
+	opts := options.Find()
+	opts.SetSort(sorts) // 设置排序
+
+	ctx := context.Background()
+	cursor, err := db.Collection(model.model).Find(ctx, query, opts)
+	if err != nil {
+		model.base.errorHandler("data.query", err, model.name)
+		return infra.Fail
+	}
+	defer cursor.Close(ctx)
+
+	// items := []Map{}
+
+	for cursor.Next(ctx) {
+
+		var res bson.M
+		if err := cursor.Decode(&res); err != nil {
+			model.base.errorHandler("data.query.decode", err, model.name)
+			return infra.Fail
+		}
+
+		//返回值需要处理特殊类型
+		result, err := transform(res)
+		if err != nil {
+			model.base.errorHandler("data.first.transform", err, model.name)
+			return infra.Fail
+		}
+
+		var item Map
+		if model.fields != nil && len(model.fields) > 0 {
+			item := Map{}
+			//直接使用err=会有问题，总是不会nil，就解析问题
+			errm := infra.Mapping(model.fields, result, item, false, true)
+			if errm.Fail() {
+				model.base.errorHandler("data.query.mapping", errm, model.name)
+				return nil
+			}
+			result = item
+		}
+
+		if res := next(item); res.Fail() {
+			return res
+		}
+		if limit > 0 {
+			limit--
+			if limit <= 0 {
+				break
+			}
+		}
+
+	}
+
+	return infra.OK
 }
