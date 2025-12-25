@@ -279,16 +279,16 @@ func (view *MongodbView) LimitRange(limit int64, next data.RangeFunc, args ...An
 			return infra.Fail
 		}
 
-		var item Map
+		item := Map{}
 		if view.fields != nil && len(view.fields) > 0 {
-			item := Map{}
 			//直接使用err=会有问题，总是不会nil，就解析问题
 			errm := infra.Mapping(view.fields, result, item, false, true)
 			if errm.Fail() {
 				view.base.errorHandler("data.query.mapping", errm, view.name)
 				return nil
 			}
-			result = item
+		} else {
+			item = result
 		}
 
 		if res := next(item); res.Fail() {
