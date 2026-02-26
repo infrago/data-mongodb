@@ -33,12 +33,13 @@ schema = "app" # MongoDB database 名
 
 [data.setting]
 database = "app" # schema 为空时可用这个
+errorMode = "auto-clear" # or sticky
 ```
 
 ## 支持能力
 
 - CRUD：`Create / CreateMany / Upsert / UpsertMany / Change / Remove / Update / Delete`
-- 查询：`Query / First / Count / Aggregate / Group / Limit / Page / Range`
+- 查询：`Query / First / Count / Aggregate / Group / Slice / Scan / ScanN`
 - DSL：比较、逻辑、`$contains/$overlap/$elemMatch`、`$after`、`$group/$agg/$having`
 - 更新：`$set/$inc/$unset/$push/$pull/$addToSet/$setPath/$unsetPath`
 - 事务：`Begin/Commit/Rollback/Tx`（Mongo Session Transaction）
@@ -119,6 +120,19 @@ rows := db.Raw("aggregate orders", []base.Map{
 })
 if db.Error() != nil {
     // handle
+}
+_ = rows
+```
+
+## 标准化 Raw API（推荐）
+
+```go
+rows := data_mongodb.FindRaw(db, "users", base.Map{"status": "active"}, base.Map{
+  "sort": base.Map{"id": base.DESC},
+  "limit": 20,
+})
+if db.Error() != nil {
+  // handle
 }
 _ = rows
 ```

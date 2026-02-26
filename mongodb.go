@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -31,6 +32,7 @@ type (
 		conn  *mongodbConnection
 		mutex sync.RWMutex
 		err   error
+		mode  string
 		txCtx mongo.SessionContext
 		txSes mongo.Session
 	}
@@ -55,6 +57,159 @@ type (
 		mongoView
 	}
 )
+
+func (b *mongoBase) fieldMappingEnabled() bool {
+	return b != nil && b.inst != nil && b.inst.Config.Mapping
+}
+
+func (b *mongoBase) storageField(field string) string {
+	field = strings.TrimSpace(field)
+	if field == "" || !b.fieldMappingEnabled() {
+		return field
+	}
+	parts := strings.Split(field, ".")
+	for i := range parts {
+		parts[i] = data.SnakeFieldPath(parts[i])
+	}
+	return strings.Join(parts, ".")
+}
+
+func (b *mongoBase) appField(field string) string {
+	field = strings.TrimSpace(field)
+	if field == "" || !b.fieldMappingEnabled() {
+		return field
+	}
+	parts := strings.Split(field, ".")
+	for i := range parts {
+		parts[i] = data.CamelFieldPath(parts[i])
+	}
+	return strings.Join(parts, ".")
+}
+
+func (b *mongoBase) toStorageMap(input Map) Map {
+	if input == nil || !b.fieldMappingEnabled() {
+		return input
+	}
+	out := Map{}
+	for k, v := range input {
+		out[b.storageField(k)] = v
+	}
+	return out
+}
+
+func (b *mongoBase) toAppMap(input Map) Map {
+	if input == nil || !b.fieldMappingEnabled() {
+		return input
+	}
+	out := Map{}
+	for k, v := range input {
+		if strings.HasPrefix(k, "$") {
+			out[k] = v
+			continue
+		}
+		out[b.appField(k)] = v
+	}
+	return out
+}
+
+func (b *mongoBase) mapQueryToStorage(q data.Query) data.Query {
+	if !b.fieldMappingEnabled() {
+		return q
+	}
+	if len(q.Select) > 0 {
+		out := make([]string, 0, len(q.Select))
+		for _, one := range q.Select {
+			out = append(out, b.storageField(one))
+		}
+		q.Select = out
+	}
+	if len(q.Sort) > 0 {
+		out := make([]data.Sort, 0, len(q.Sort))
+		for _, one := range q.Sort {
+			out = append(out, data.Sort{Field: b.storageField(one.Field), Desc: one.Desc})
+		}
+		q.Sort = out
+	}
+	if len(q.Group) > 0 {
+		out := make([]string, 0, len(q.Group))
+		for _, one := range q.Group {
+			out = append(out, b.storageField(one))
+		}
+		q.Group = out
+	}
+	if len(q.Aggs) > 0 {
+		out := make([]data.Agg, 0, len(q.Aggs))
+		for _, one := range q.Aggs {
+			field := one.Field
+			if field != "*" && field != "" {
+				field = b.storageField(field)
+			}
+			out = append(out, data.Agg{Alias: one.Alias, Op: one.Op, Field: field})
+		}
+		q.Aggs = out
+	}
+	if len(q.After) > 0 {
+		after := Map{}
+		for k, v := range q.After {
+			after[b.storageField(k)] = v
+		}
+		q.After = after
+	}
+	if len(q.Joins) > 0 {
+		out := make([]data.Join, 0, len(q.Joins))
+		for _, j := range q.Joins {
+			out = append(out, data.Join{
+				From:         j.From,
+				Alias:        j.Alias,
+				Type:         j.Type,
+				LocalField:   b.storageField(j.LocalField),
+				ForeignField: b.storageField(j.ForeignField),
+				On:           b.mapExprToStorage(j.On),
+			})
+		}
+		q.Joins = out
+	}
+	q.Filter = b.mapExprToStorage(q.Filter)
+	q.Having = b.mapExprToStorage(q.Having)
+	return q
+}
+
+func (b *mongoBase) mapExprToStorage(expr data.Expr) data.Expr {
+	switch e := expr.(type) {
+	case nil:
+		return nil
+	case data.TrueExpr:
+		return e
+	case data.AndExpr:
+		items := make([]data.Expr, 0, len(e.Items))
+		for _, one := range e.Items {
+			items = append(items, b.mapExprToStorage(one))
+		}
+		return data.AndExpr{Items: items}
+	case data.OrExpr:
+		items := make([]data.Expr, 0, len(e.Items))
+		for _, one := range e.Items {
+			items = append(items, b.mapExprToStorage(one))
+		}
+		return data.OrExpr{Items: items}
+	case data.NotExpr:
+		return data.NotExpr{Item: b.mapExprToStorage(e.Item)}
+	case data.ExistsExpr:
+		return data.ExistsExpr{Field: b.storageField(e.Field), Yes: e.Yes}
+	case data.NullExpr:
+		return data.NullExpr{Field: b.storageField(e.Field), Yes: e.Yes}
+	case data.RawExpr:
+		return e
+	case data.CmpExpr:
+		v := e.Value
+		if rf, ok := v.(data.FieldRef); ok {
+			v = data.Ref(b.storageField(string(rf)))
+		}
+		return data.CmpExpr{Field: b.storageField(e.Field), Op: e.Op, Value: v}
+	default:
+		return e
+	}
+}
 
 func (d *mongodbDriver) Connect(inst *data.Instance) (data.Connection, error) {
 	return &mongodbConnection{instance: inst}, nil
@@ -117,7 +272,7 @@ func (c *mongodbConnection) DB() *sql.DB { return nil }
 func (c *mongodbConnection) Dialect() data.Dialect { return mongoDialect{} }
 
 func (c *mongodbConnection) Base(inst *data.Instance) data.DataBase {
-	return &mongoBase{inst: inst, conn: c}
+	return &mongoBase{inst: inst, conn: c, mode: mongoErrorModeFromSetting(inst.Config.Setting)}
 }
 
 type mongoDialect struct{}
@@ -236,9 +391,25 @@ func (b *mongoBase) Tx(fn data.TxFunc) error {
 	b.setError(err)
 	return err
 }
-func (b *mongoBase) setError(err error) { b.mutex.Lock(); b.err = err; b.mutex.Unlock() }
-func (b *mongoBase) Error() error       { b.mutex.RLock(); defer b.mutex.RUnlock(); return b.err }
-func (b *mongoBase) ClearError()        { b.setError(nil) }
+func (b *mongoBase) setError(err error) {
+	b.mutex.Lock()
+	if err == nil && b.mode == "sticky" {
+		b.mutex.Unlock()
+		return
+	}
+	b.err = err
+	b.mutex.Unlock()
+}
+func (b *mongoBase) Error() error {
+	b.mutex.Lock()
+	defer b.mutex.Unlock()
+	err := b.err
+	if b.mode == "auto-clear" {
+		b.err = nil
+	}
+	return err
+}
+func (b *mongoBase) ClearError() { b.setError(nil) }
 func (b *mongoBase) opContext(timeout time.Duration) (context.Context, context.CancelFunc) {
 	b.mutex.RLock()
 	sc := b.txCtx
@@ -281,123 +452,30 @@ func (b *mongoBase) Raw(query string, args ...Any) []Map {
 			b.setError(fmt.Errorf("raw aggregate requires collection name"))
 			return nil
 		}
-		coll := parts[1]
-		pipeline, err := parsePipelineArg(firstArg(args))
-		if err != nil {
-			b.setError(err)
-			return nil
-		}
-		ctx, cancel := b.opContext(20 * time.Second)
-		defer cancel()
-		cur, err := b.conn.db.Collection(coll).Aggregate(ctx, pipeline)
-		if err != nil {
-			b.setError(err)
-			return nil
-		}
-		defer cur.Close(ctx)
-		out := make([]Map, 0)
-		for cur.Next(ctx) {
-			row := bson.M{}
-			if err := cur.Decode(&row); err != nil {
-				b.setError(err)
-				return nil
-			}
-			out = append(out, bsonToMap(row))
-		}
-		if err := cur.Err(); err != nil {
-			b.setError(err)
-			return nil
-		}
-		b.setError(nil)
-		return out
+		return b.AggregateRaw(parts[1], firstArg(args))
 	case strings.HasPrefix(lower, "find "):
 		parts := strings.Fields(cmd)
 		if len(parts) < 2 {
 			b.setError(fmt.Errorf("raw find requires collection name"))
 			return nil
 		}
-		coll := parts[1]
-		filter := bson.M{}
-		if len(args) > 0 {
-			f, err := toBsonMap(args[0])
-			if err != nil {
-				b.setError(err)
-				return nil
-			}
-			filter = f
-		}
-		opts := options.Find()
 		if len(args) > 1 {
-			if m, ok := args[1].(Map); ok {
-				if sorts, ok := m["sort"].(Map); ok {
-					sd := bson.D{}
-					for k, v := range sorts {
-						dir := int32(1)
-						switch vv := v.(type) {
-						case int:
-							if vv < 0 {
-								dir = -1
-							}
-						case int64:
-							if vv < 0 {
-								dir = -1
-							}
-						}
-						sd = append(sd, bson.E{Key: k, Value: dir})
-					}
-					opts.SetSort(sd)
-				}
-				if lim, ok := parseInt64(m["limit"]); ok && lim > 0 {
-					opts.SetLimit(lim)
-				}
-				if off, ok := parseInt64(m["offset"]); ok && off > 0 {
-					opts.SetSkip(off)
-				}
+			if opt, ok := args[1].(Map); ok {
+				return b.FindRaw(parts[1], firstArg(args), opt)
 			}
 		}
-		ctx, cancel := b.opContext(20 * time.Second)
-		defer cancel()
-		cur, err := b.conn.db.Collection(coll).Find(ctx, filter, opts)
-		if err != nil {
-			b.setError(err)
-			return nil
-		}
-		defer cur.Close(ctx)
-		out := make([]Map, 0)
-		for cur.Next(ctx) {
-			row := bson.M{}
-			if err := cur.Decode(&row); err != nil {
-				b.setError(err)
-				return nil
-			}
-			out = append(out, bsonToMap(row))
-		}
-		if err := cur.Err(); err != nil {
-			b.setError(err)
-			return nil
-		}
-		b.setError(nil)
-		return out
+		return b.FindRaw(parts[1], firstArg(args))
 	default:
 		command, err := parseCommand(query, firstArg(args))
 		if err != nil {
 			b.setError(err)
 			return nil
 		}
-		ctx, cancel := b.opContext(20 * time.Second)
-		defer cancel()
-		res := b.conn.db.RunCommand(ctx, command)
-		if res.Err() != nil {
-			b.setError(res.Err())
+		row := b.Command(command)
+		if b.Error() != nil || row == nil {
 			return nil
 		}
-		row := bson.M{}
-		if err := res.Decode(&row); err != nil {
-			b.setError(err)
-			return nil
-		}
-		b.setError(nil)
-		return []Map{bsonToMap(row)}
+		return []Map{row}
 	}
 }
 func (b *mongoBase) Exec(query string, args ...Any) int64 {
@@ -459,10 +537,13 @@ func (b *mongoBase) Exec(query string, args ...Any) int64 {
 			b.setError(err)
 			return 0
 		}
+		if b.fieldMappingEnabled() {
+			filter = bson.M(b.toStorageMap(Map(filter)))
+		}
 		var update bson.M
 		if len(args) > 1 {
 			if m, ok := args[1].(Map); ok {
-				update = buildUpdateDoc(m)
+				update = buildUpdateDoc(b, m)
 			} else {
 				update, err = toBsonMap(args[1])
 				if err != nil {
@@ -494,7 +575,7 @@ func (b *mongoBase) Exec(query string, args ...Any) int64 {
 		}
 		docs := make([]any, 0, len(rows))
 		for _, row := range rows {
-			docs = append(docs, bson.M(row))
+			docs = append(docs, bson.M(b.toStorageMap(row)))
 		}
 		res, err := b.conn.db.Collection(parts[1]).InsertMany(ctx, docs)
 		if err != nil {
@@ -509,40 +590,493 @@ func (b *mongoBase) Exec(query string, args ...Any) int64 {
 			b.setError(err)
 			return 0
 		}
-		if err := b.conn.db.RunCommand(ctx, command).Err(); err != nil {
-			b.setError(err)
+		row := b.Command(command)
+		if b.Error() != nil || row == nil {
 			return 0
 		}
-		b.setError(nil)
 		return 1
 	}
 }
 
+func (b *mongoBase) Command(cmd Any) Map {
+	command, err := parseCommand("command", cmd)
+	if err != nil {
+		b.setError(err)
+		return nil
+	}
+	ctx, cancel := b.opContext(20 * time.Second)
+	defer cancel()
+	res := b.conn.db.RunCommand(ctx, command)
+	if res.Err() != nil {
+		b.setError(res.Err())
+		return nil
+	}
+	row := bson.M{}
+	if err := res.Decode(&row); err != nil {
+		b.setError(err)
+		return nil
+	}
+	b.setError(nil)
+	return bsonToMap(row)
+}
+
+func (b *mongoBase) FindRaw(collection string, filter Any, opts ...Map) []Map {
+	f, err := toBsonMap(filter)
+	if err != nil {
+		b.setError(err)
+		return nil
+	}
+	findOpts := options.Find()
+	if len(opts) > 0 {
+		m := opts[0]
+		if sorts, ok := m["sort"].(Map); ok {
+			sd := bson.D{}
+			for k, v := range sorts {
+				dir := int32(1)
+				switch vv := v.(type) {
+				case int:
+					if vv < 0 {
+						dir = -1
+					}
+				case int64:
+					if vv < 0 {
+						dir = -1
+					}
+				}
+				sd = append(sd, bson.E{Key: k, Value: dir})
+			}
+			findOpts.SetSort(sd)
+		}
+		if lim, ok := parseInt64(m["limit"]); ok && lim > 0 {
+			findOpts.SetLimit(lim)
+		}
+		if off, ok := parseInt64(m["offset"]); ok && off > 0 {
+			findOpts.SetSkip(off)
+		}
+	}
+	ctx, cancel := b.opContext(20 * time.Second)
+	defer cancel()
+	cur, err := b.conn.db.Collection(collection).Find(ctx, f, findOpts)
+	if err != nil {
+		b.setError(err)
+		return nil
+	}
+	defer cur.Close(ctx)
+	out := make([]Map, 0)
+	for cur.Next(ctx) {
+		row := bson.M{}
+		if err := cur.Decode(&row); err != nil {
+			b.setError(err)
+			return nil
+		}
+		out = append(out, bsonToMap(row))
+	}
+	if err := cur.Err(); err != nil {
+		b.setError(err)
+		return nil
+	}
+	b.setError(nil)
+	return out
+}
+
+func (b *mongoBase) AggregateRaw(collection string, pipeline Any) []Map {
+	pipe, err := parsePipelineArg(pipeline)
+	if err != nil {
+		b.setError(err)
+		return nil
+	}
+	ctx, cancel := b.opContext(20 * time.Second)
+	defer cancel()
+	cur, err := b.conn.db.Collection(collection).Aggregate(ctx, pipe)
+	if err != nil {
+		b.setError(err)
+		return nil
+	}
+	defer cur.Close(ctx)
+	out := make([]Map, 0)
+	for cur.Next(ctx) {
+		row := bson.M{}
+		if err := cur.Decode(&row); err != nil {
+			b.setError(err)
+			return nil
+		}
+		out = append(out, bsonToMap(row))
+	}
+	if err := cur.Err(); err != nil {
+		b.setError(err)
+		return nil
+	}
+	b.setError(nil)
+	return out
+}
+
 func (b *mongoBase) Migrate(names ...string) {
+	_, _ = b.migrateWith(names, data.MigrateOptions{})
+}
+
+func (b *mongoBase) MigratePlan(names ...string) data.MigrateReport {
+	report, _ := b.migrateWith(names, data.MigrateOptions{DryRun: true})
+	return report
+}
+
+func (b *mongoBase) MigrateDiff(names ...string) data.MigrateReport {
+	report, _ := b.migrateWith(names, data.MigrateOptions{DryRun: true, DiffOnly: true})
+	return report
+}
+
+func (b *mongoBase) MigrateUp(versions ...string) {
+	b.setError(b.runVersionedUp(versions...))
+}
+
+func (b *mongoBase) MigrateDown(steps int) {
+	b.setError(b.runVersionedDown(steps))
+}
+
+func (b *mongoBase) MigrateTo(version string) {
+	b.setError(b.runVersionedTo(version))
+}
+
+func (b *mongoBase) MigrateDownTo(version string) {
+	b.setError(b.runVersionedDownTo(version))
+}
+
+func (b *mongoBase) migrateWith(names []string, override data.MigrateOptions) (data.MigrateReport, error) {
+	opts := b.inst.Config.Migrate
+	if opts.Mode == "" {
+		opts.Mode = "safe"
+	}
+	if override.Mode != "" {
+		opts.Mode = strings.ToLower(strings.TrimSpace(override.Mode))
+	}
+	if override.DryRun {
+		opts.DryRun = true
+	}
+	if override.DiffOnly {
+		opts.DiffOnly = true
+		opts.DryRun = true
+	}
+	if opts.Timeout <= 0 {
+		opts.Timeout = 5 * time.Minute
+	}
+	if opts.LockTimeout <= 0 {
+		opts.LockTimeout = 30 * time.Second
+	}
+	if opts.Retry < 0 {
+		opts.Retry = 0
+	}
+	if opts.RetryDelay <= 0 {
+		opts.RetryDelay = 500 * time.Millisecond
+	}
+	if opts.Jitter <= 0 {
+		opts.Jitter = 250 * time.Millisecond
+	}
+
+	report := data.MigrateReport{
+		Mode:    opts.Mode,
+		DryRun:  opts.DryRun,
+		Actions: make([]data.MigrateAction, 0, 8),
+	}
+
 	targets := names
+	explicit := len(targets) > 0
 	if len(targets) == 0 {
 		for name := range data.Tables() {
 			targets = append(targets, name)
 		}
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	sort.Strings(targets)
+	if !opts.DryRun && opts.Jitter > 0 {
+		time.Sleep(time.Duration(time.Now().UnixNano() % int64(opts.Jitter)))
+	}
+	unlock := func() {}
+	if !opts.DryRun {
+		u, err := b.acquireMigrateLock(opts)
+		if err != nil {
+			b.setError(err)
+			return report, err
+		}
+		unlock = u
+	}
+	defer unlock()
+
+	ctx, cancel := context.WithTimeout(context.Background(), opts.Timeout)
 	defer cancel()
 	for _, name := range targets {
 		t, ok := resolveTable(b.inst.Name, name)
 		if !ok {
+			if explicit {
+				err := fmt.Errorf("data table not found: %s", name)
+				b.setError(err)
+				return report, err
+			}
 			continue
 		}
 		source := pickName(name, t.Table)
-		if err := b.ensureCollection(ctx, source); err != nil {
+		cols, err := b.conn.db.ListCollectionNames(ctx, bson.M{"name": source})
+		if err != nil {
 			b.setError(err)
-			return
+			return report, err
 		}
-		if err := b.ensureIndexes(ctx, source, t); err != nil {
+		if len(cols) == 0 {
+			report.Actions = append(report.Actions, data.MigrateAction{
+				Kind:   "create_collection",
+				Target: source,
+				Apply:  !opts.DryRun,
+			})
+			if !opts.DryRun {
+				if err := b.migrateRetry(opts, func() error { return b.conn.db.CreateCollection(ctx, source) }); err != nil {
+					b.setError(err)
+					return report, err
+				}
+			}
+		}
+		indexes := b.collectIndexes(source, t)
+		exists, err := b.loadIndexNames(ctx, source)
+		if err != nil {
 			b.setError(err)
-			return
+			return report, err
+		}
+		for _, idx := range indexes {
+			name := ""
+			if idx.Options != nil && idx.Options.Name != nil {
+				name = strings.TrimSpace(*idx.Options.Name)
+			}
+			if name == "" {
+				continue
+			}
+			if _, ok := exists[strings.ToLower(name)]; ok {
+				continue
+			}
+			report.Actions = append(report.Actions, data.MigrateAction{
+				Kind:   "create_index",
+				Target: name,
+				Apply:  !opts.DryRun,
+			})
+			if !opts.DryRun {
+				if err := b.migrateRetry(opts, func() error {
+					_, err := b.conn.db.Collection(source).Indexes().CreateOne(ctx, idx)
+					return err
+				}); err != nil {
+					b.setError(err)
+					return report, err
+				}
+			}
 		}
 	}
 	b.setError(nil)
+	return report, nil
+}
+
+func (b *mongoBase) runVersionedUp(versions ...string) error {
+	all := data.Migrations(b.inst.Name)
+	if len(all) == 0 {
+		return nil
+	}
+	allow := map[string]struct{}{}
+	if len(versions) > 0 {
+		for _, v := range versions {
+			allow[strings.TrimSpace(v)] = struct{}{}
+		}
+	}
+	opts := b.inst.Config.Migrate
+	if opts.LockTimeout <= 0 {
+		opts.LockTimeout = 30 * time.Second
+	}
+	if opts.RetryDelay <= 0 {
+		opts.RetryDelay = 500 * time.Millisecond
+	}
+	if opts.Jitter <= 0 {
+		opts.Jitter = 250 * time.Millisecond
+	}
+	unlock, err := b.acquireMigrateLock(opts)
+	if err != nil {
+		return err
+	}
+	defer unlock()
+
+	applied, err := b.loadVersionApplied()
+	if err != nil {
+		return err
+	}
+	for _, mg := range all {
+		if len(allow) > 0 {
+			if _, ok := allow[mg.Version]; !ok {
+				continue
+			}
+		}
+		if c, ok := applied[mg.Version]; ok {
+			if c != mg.Checksum() {
+				return fmt.Errorf("migration checksum mismatch: %s", mg.Version)
+			}
+			continue
+		}
+		if mg.Up == nil {
+			return fmt.Errorf("migration up not defined: %s", mg.Version)
+		}
+		if err := b.Tx(func(tx data.DataBase) error { return mg.Up(tx) }); err != nil {
+			return err
+		}
+		if err := b.markVersionApplied(mg); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (b *mongoBase) runVersionedDown(steps int) error {
+	if steps <= 0 {
+		steps = 1
+	}
+	opts := b.inst.Config.Migrate
+	if opts.LockTimeout <= 0 {
+		opts.LockTimeout = 30 * time.Second
+	}
+	if opts.RetryDelay <= 0 {
+		opts.RetryDelay = 500 * time.Millisecond
+	}
+	if opts.Jitter <= 0 {
+		opts.Jitter = 250 * time.Millisecond
+	}
+	unlock, err := b.acquireMigrateLock(opts)
+	if err != nil {
+		return err
+	}
+	defer unlock()
+
+	applied, err := b.loadVersionAppliedOrderedDesc()
+	if err != nil {
+		return err
+	}
+	if len(applied) == 0 {
+		return nil
+	}
+	mm := map[string]data.Migration{}
+	for _, mg := range data.Migrations(b.inst.Name) {
+		mm[mg.Version] = mg
+	}
+	count := 0
+	for _, v := range applied {
+		if count >= steps {
+			break
+		}
+		mg, ok := mm[v]
+		if !ok {
+			return fmt.Errorf("migration version not registered: %s", v)
+		}
+		if mg.Down == nil {
+			return fmt.Errorf("migration down not defined: %s", v)
+		}
+		if err := b.Tx(func(tx data.DataBase) error { return mg.Down(tx) }); err != nil {
+			return err
+		}
+		if err := b.unmarkVersionApplied(v); err != nil {
+			return err
+		}
+		count++
+	}
+	return nil
+}
+
+func (b *mongoBase) runVersionedTo(target string) error {
+	target = strings.TrimSpace(target)
+	if target == "" {
+		return fmt.Errorf("empty migrate target version")
+	}
+	all := data.Migrations(b.inst.Name)
+	if len(all) == 0 {
+		return nil
+	}
+	applied, err := b.loadVersionApplied()
+	if err != nil {
+		return err
+	}
+	allow := make([]string, 0, 8)
+	found := false
+	for _, mg := range all {
+		if mg.Version == target {
+			found = true
+		}
+		if _, ok := applied[mg.Version]; ok {
+			continue
+		}
+		allow = append(allow, mg.Version)
+		if mg.Version == target {
+			break
+		}
+	}
+	if !found {
+		return fmt.Errorf("migration target version not found: %s", target)
+	}
+	if len(allow) == 0 {
+		return nil
+	}
+	return b.runVersionedUp(allow...)
+}
+
+func (b *mongoBase) runVersionedDownTo(target string) error {
+	target = strings.TrimSpace(target)
+	if target == "" {
+		return fmt.Errorf("empty migrate down target version")
+	}
+	applied, err := b.loadVersionAppliedOrderedDesc()
+	if err != nil {
+		return err
+	}
+	steps := 0
+	for _, v := range applied {
+		if v > target {
+			steps++
+		}
+	}
+	if steps <= 0 {
+		return nil
+	}
+	return b.runVersionedDown(steps)
+}
+
+func (b *mongoBase) acquireMigrateLock(opts data.MigrateOptions) (func(), error) {
+	lockColl := b.conn.db.Collection("_bamgoo_migrate_lock")
+	key := b.inst.Name
+	deadline := time.Now().Add(opts.LockTimeout)
+	for {
+		_, err := lockColl.InsertOne(context.Background(), bson.M{
+			"_id":       key,
+			"createdAt": time.Now(),
+		})
+		if err == nil {
+			return func() {
+				_, _ = lockColl.DeleteOne(context.Background(), bson.M{"_id": key})
+			}, nil
+		}
+		msg := strings.ToLower(err.Error())
+		if !strings.Contains(msg, "duplicate key") && !strings.Contains(msg, "e11000") {
+			return nil, err
+		}
+		if time.Now().After(deadline) {
+			return nil, fmt.Errorf("migrate lock timeout after %s", opts.LockTimeout)
+		}
+		time.Sleep(opts.RetryDelay + time.Duration(time.Now().UnixNano()%int64(opts.Jitter)))
+	}
+}
+
+func (b *mongoBase) migrateRetry(opts data.MigrateOptions, run func() error) error {
+	try := opts.Retry + 1
+	if try < 1 {
+		try = 1
+	}
+	var last error
+	for i := 0; i < try; i++ {
+		if err := run(); err == nil {
+			return nil
+		} else {
+			last = err
+		}
+		if i >= try-1 {
+			break
+		}
+		time.Sleep(opts.RetryDelay + time.Duration(time.Now().UnixNano()%int64(opts.Jitter)))
+	}
+	return last
 }
 
 func (b *mongoBase) ensureCollection(ctx context.Context, name string) error {
@@ -557,6 +1091,15 @@ func (b *mongoBase) ensureCollection(ctx context.Context, name string) error {
 }
 
 func (b *mongoBase) ensureIndexes(ctx context.Context, source string, table data.Table) error {
+	items := b.collectIndexes(source, table)
+	if len(items) == 0 {
+		return nil
+	}
+	_, err := b.conn.db.Collection(source).Indexes().CreateMany(ctx, items)
+	return err
+}
+
+func (b *mongoBase) collectIndexes(source string, table data.Table) []mongo.IndexModel {
 	items := make([]mongo.IndexModel, 0)
 	for i, idx := range table.Indexes {
 		if len(idx.Fields) == 0 {
@@ -592,10 +1135,105 @@ func (b *mongoBase) ensureIndexes(ctx context.Context, source string, table data
 			}
 		}
 	}
-	if len(items) == 0 {
-		return nil
+	return items
+}
+
+func (b *mongoBase) loadIndexNames(ctx context.Context, source string) (map[string]struct{}, error) {
+	out := map[string]struct{}{}
+	cur, err := b.conn.db.Collection(source).Indexes().List(ctx)
+	if err != nil {
+		return nil, err
 	}
-	_, err := b.conn.db.Collection(source).Indexes().CreateMany(ctx, items)
+	defer cur.Close(ctx)
+	for cur.Next(ctx) {
+		m := bson.M{}
+		if err := cur.Decode(&m); err != nil {
+			return nil, err
+		}
+		name, _ := m["name"].(string)
+		if strings.TrimSpace(name) != "" {
+			out[strings.ToLower(name)] = struct{}{}
+		}
+	}
+	return out, cur.Err()
+}
+
+func (b *mongoBase) versionColl() *mongo.Collection {
+	return b.conn.db.Collection("_bamgoo_migrations_v2")
+}
+
+func (b *mongoBase) loadVersionApplied() (map[string]string, error) {
+	ctx, cancel := b.opContext(10 * time.Second)
+	defer cancel()
+	cur, err := b.versionColl().Find(ctx, bson.M{})
+	if err != nil {
+		msg := strings.ToLower(err.Error())
+		if strings.Contains(msg, "namespace") && strings.Contains(msg, "not found") {
+			return map[string]string{}, nil
+		}
+		return nil, err
+	}
+	defer cur.Close(ctx)
+	out := map[string]string{}
+	for cur.Next(ctx) {
+		m := bson.M{}
+		if err := cur.Decode(&m); err != nil {
+			return nil, err
+		}
+		v, _ := m["version"].(string)
+		c, _ := m["checksum"].(string)
+		if strings.TrimSpace(v) != "" {
+			out[v] = c
+		}
+	}
+	return out, cur.Err()
+}
+
+func (b *mongoBase) loadVersionAppliedOrderedDesc() ([]string, error) {
+	ctx, cancel := b.opContext(10 * time.Second)
+	defer cancel()
+	opts := options.Find().SetSort(bson.D{{Key: "appliedAt", Value: -1}, {Key: "version", Value: -1}})
+	cur, err := b.versionColl().Find(ctx, bson.M{}, opts)
+	if err != nil {
+		msg := strings.ToLower(err.Error())
+		if strings.Contains(msg, "namespace") && strings.Contains(msg, "not found") {
+			return []string{}, nil
+		}
+		return nil, err
+	}
+	defer cur.Close(ctx)
+	out := make([]string, 0)
+	for cur.Next(ctx) {
+		m := bson.M{}
+		if err := cur.Decode(&m); err != nil {
+			return nil, err
+		}
+		v, _ := m["version"].(string)
+		if strings.TrimSpace(v) != "" {
+			out = append(out, v)
+		}
+	}
+	return out, cur.Err()
+}
+
+func (b *mongoBase) markVersionApplied(mg data.Migration) error {
+	ctx, cancel := b.opContext(10 * time.Second)
+	defer cancel()
+	_, err := b.versionColl().UpdateOne(ctx, bson.M{"version": mg.Version}, bson.M{
+		"$set": bson.M{
+			"version":   mg.Version,
+			"name":      mg.Name,
+			"checksum":  mg.Checksum(),
+			"appliedAt": time.Now(),
+		},
+	}, options.Update().SetUpsert(true))
+	return err
+}
+
+func (b *mongoBase) unmarkVersionApplied(version string) error {
+	ctx, cancel := b.opContext(10 * time.Second)
+	defer cancel()
+	_, err := b.versionColl().DeleteOne(ctx, bson.M{"version": version})
 	return err
 }
 
@@ -631,7 +1269,7 @@ func (t *mongoTable) coll() *mongo.Collection { return t.base.conn.db.Collection
 func (t *mongoTable) Create(dataIn Map) Map {
 	ctx, cancel := t.base.opContext(10 * time.Second)
 	defer cancel()
-	doc := bson.M(dataIn)
+	doc := bson.M(t.base.toStorageMap(dataIn))
 	res, err := t.coll().InsertOne(ctx, doc)
 	if err != nil {
 		t.base.setError(err)
@@ -654,7 +1292,7 @@ func (t *mongoTable) CreateMany(items []Map) []Map {
 	defer cancel()
 	docs := make([]any, 0, len(items))
 	for _, item := range items {
-		docs = append(docs, bson.M(item))
+		docs = append(docs, bson.M(t.base.toStorageMap(item)))
 	}
 	res, err := t.coll().InsertMany(ctx, docs)
 	if err != nil {
@@ -678,19 +1316,19 @@ func (t *mongoTable) Upsert(dataIn Map, args ...Any) Map {
 	if len(args) > 0 {
 		if m, ok := args[0].(Map); ok {
 			for k, v := range m {
-				filter[k] = v
+				filter[t.base.storageField(k)] = v
 			}
 		}
 	}
 	if len(filter) == 0 {
 		if id, ok := dataIn[t.key]; ok {
-			filter[t.key] = id
+			filter[t.base.storageField(t.key)] = id
 		}
 	}
 	if len(filter) == 0 {
 		return t.Create(dataIn)
 	}
-	upd := buildUpdateDoc(dataIn)
+	upd := buildUpdateDoc(t.base, dataIn)
 	ctx, cancel := t.base.opContext(10 * time.Second)
 	defer cancel()
 	_, err := t.coll().UpdateOne(ctx, bson.M(filter), upd, options.Update().SetUpsert(true))
@@ -720,10 +1358,10 @@ func (t *mongoTable) Change(item Map, dataIn Map) Map {
 		t.base.setError(fmt.Errorf("missing primary key %s", t.key))
 		return nil
 	}
-	upd := buildUpdateDoc(dataIn)
+	upd := buildUpdateDoc(t.base, dataIn)
 	ctx, cancel := t.base.opContext(10 * time.Second)
 	defer cancel()
-	_, err := t.coll().UpdateOne(ctx, bson.M{t.key: item[t.key]}, upd)
+	_, err := t.coll().UpdateOne(ctx, bson.M{t.base.storageField(t.key): item[t.key]}, upd)
 	if err != nil {
 		t.base.setError(err)
 		return nil
@@ -738,7 +1376,7 @@ func (t *mongoTable) Remove(args ...Any) Map {
 	}
 	ctx, cancel := t.base.opContext(10 * time.Second)
 	defer cancel()
-	_, err := t.coll().DeleteOne(ctx, bson.M{t.key: item[t.key]})
+	_, err := t.coll().DeleteOne(ctx, bson.M{t.base.storageField(t.key): item[t.key]})
 	if err != nil {
 		t.base.setError(err)
 		return nil
@@ -753,6 +1391,7 @@ func (t *mongoTable) Update(sets Map, args ...Any) int64 {
 		t.base.setError(err)
 		return 0
 	}
+	q = t.base.mapQueryToStorage(q)
 	filter, err := exprToFilter(q.Filter)
 	if err != nil {
 		t.base.setError(err)
@@ -760,7 +1399,7 @@ func (t *mongoTable) Update(sets Map, args ...Any) int64 {
 	}
 	ctx, cancel := t.base.opContext(10 * time.Second)
 	defer cancel()
-	res, err := t.coll().UpdateMany(ctx, filter, buildUpdateDoc(sets))
+	res, err := t.coll().UpdateMany(ctx, filter, buildUpdateDoc(t.base, sets))
 	if err != nil {
 		t.base.setError(err)
 		return 0
@@ -775,6 +1414,7 @@ func (t *mongoTable) Delete(args ...Any) int64 {
 		t.base.setError(err)
 		return 0
 	}
+	q = t.base.mapQueryToStorage(q)
 	filter, err := exprToFilter(q.Filter)
 	if err != nil {
 		t.base.setError(err)
@@ -796,17 +1436,14 @@ func (t *mongoTable) Count(args ...Any) int64     { return (*mongoView)(t).Count
 func (t *mongoTable) Aggregate(args ...Any) []Map { return (*mongoView)(t).Aggregate(args...) }
 func (t *mongoTable) First(args ...Any) Map       { return (*mongoView)(t).First(args...) }
 func (t *mongoTable) Query(args ...Any) []Map     { return (*mongoView)(t).Query(args...) }
-func (t *mongoTable) Range(next data.RangeFunc, args ...Any) Res {
-	return (*mongoView)(t).Range(next, args...)
+func (t *mongoTable) Scan(next data.ScanFunc, args ...Any) Res {
+	return (*mongoView)(t).Scan(next, args...)
 }
-func (t *mongoTable) LimitRange(limit int64, next data.RangeFunc, args ...Any) Res {
-	return (*mongoView)(t).LimitRange(limit, next, args...)
+func (t *mongoTable) ScanN(limit int64, next data.ScanFunc, args ...Any) Res {
+	return (*mongoView)(t).ScanN(limit, next, args...)
 }
-func (t *mongoTable) Limit(offset, limit int64, args ...Any) (int64, []Map) {
-	return (*mongoView)(t).Limit(offset, limit, args...)
-}
-func (t *mongoTable) Page(offset, limit int64, args ...Any) data.PageResult {
-	return (*mongoView)(t).Page(offset, limit, args...)
+func (t *mongoTable) Slice(offset, limit int64, args ...Any) (int64, []Map) {
+	return (*mongoView)(t).Slice(offset, limit, args...)
 }
 func (t *mongoTable) Group(field string, args ...Any) []Map {
 	return (*mongoView)(t).Group(field, args...)
@@ -820,6 +1457,7 @@ func (v *mongoView) Count(args ...Any) int64 {
 		v.base.setError(err)
 		return 0
 	}
+	q = v.base.mapQueryToStorage(q)
 	filter, err := exprToFilter(q.Filter)
 	if err != nil {
 		v.base.setError(err)
@@ -843,6 +1481,7 @@ func (v *mongoView) First(args ...Any) Map {
 		return nil
 	}
 	q.Limit = 1
+	q = v.base.mapQueryToStorage(q)
 	items, err := v.queryWithQuery(q)
 	if err != nil {
 		v.base.setError(err)
@@ -862,6 +1501,7 @@ func (v *mongoView) Query(args ...Any) []Map {
 		v.base.setError(err)
 		return nil
 	}
+	q = v.base.mapQueryToStorage(q)
 	items, err := v.queryWithQuery(q)
 	v.base.setError(err)
 	return items
@@ -876,16 +1516,17 @@ func (v *mongoView) Aggregate(args ...Any) []Map {
 	if len(q.Aggs) == 0 {
 		q.Aggs = []data.Agg{{Alias: "$count", Op: "count", Field: "*"}}
 	}
+	q = v.base.mapQueryToStorage(q)
 	items, err := v.aggregateWithQuery(q)
 	v.base.setError(err)
 	return items
 }
 
-func (v *mongoView) Range(next data.RangeFunc, args ...Any) Res {
-	return v.LimitRange(0, next, args...)
+func (v *mongoView) Scan(next data.ScanFunc, args ...Any) Res {
+	return v.ScanN(0, next, args...)
 }
 
-func (v *mongoView) LimitRange(limit int64, next data.RangeFunc, args ...Any) Res {
+func (v *mongoView) ScanN(limit int64, next data.ScanFunc, args ...Any) Res {
 	if next == nil {
 		return nil
 	}
@@ -894,6 +1535,7 @@ func (v *mongoView) LimitRange(limit int64, next data.RangeFunc, args ...Any) Re
 		v.base.setError(err)
 		return nil
 	}
+	q = v.base.mapQueryToStorage(q)
 	if limit > 0 {
 		q.Limit = limit
 	}
@@ -911,20 +1553,18 @@ func (v *mongoView) LimitRange(limit int64, next data.RangeFunc, args ...Any) Re
 	return nil
 }
 
-func (v *mongoView) Limit(offset, limit int64, args ...Any) (int64, []Map) {
+func (v *mongoView) Slice(offset, limit int64, args ...Any) (int64, []Map) {
 	q, err := data.Parse(args...)
 	if err != nil {
 		v.base.setError(err)
 		return 0, nil
 	}
+	q = v.base.mapQueryToStorage(q)
 	q.Offset = offset
 	q.Limit = limit
-	total := int64(-1)
-	if q.WithCount {
-		total = v.Count(args...)
-		if v.base.Error() != nil {
-			return 0, nil
-		}
+	total := v.Count(args...)
+	if v.base.Error() != nil {
+		return 0, nil
 	}
 	items, err := v.queryWithQuery(q)
 	if err != nil {
@@ -933,11 +1573,6 @@ func (v *mongoView) Limit(offset, limit int64, args ...Any) (int64, []Map) {
 	}
 	v.base.setError(nil)
 	return total, items
-}
-
-func (v *mongoView) Page(offset, limit int64, args ...Any) data.PageResult {
-	total, items := v.Limit(offset, limit, args...)
-	return data.PageResult{Offset: offset, Limit: limit, Total: total, Items: items}
 }
 
 func (v *mongoView) Group(field string, args ...Any) []Map {
@@ -952,6 +1587,7 @@ func (v *mongoView) Group(field string, args ...Any) []Map {
 	if len(q.Aggs) == 0 {
 		q.Aggs = []data.Agg{{Alias: "$count", Op: "count", Field: "*"}}
 	}
+	q = v.base.mapQueryToStorage(q)
 	items, err := v.aggregateWithQuery(q)
 	v.base.setError(err)
 	return items
@@ -959,17 +1595,14 @@ func (v *mongoView) Group(field string, args ...Any) []Map {
 
 func (m *mongoModel) First(args ...Any) Map   { return m.mongoView.First(args...) }
 func (m *mongoModel) Query(args ...Any) []Map { return m.mongoView.Query(args...) }
-func (m *mongoModel) Range(next data.RangeFunc, args ...Any) Res {
-	return m.mongoView.Range(next, args...)
+func (m *mongoModel) Scan(next data.ScanFunc, args ...Any) Res {
+	return m.mongoView.Scan(next, args...)
 }
-func (m *mongoModel) LimitRange(limit int64, next data.RangeFunc, args ...Any) Res {
-	return m.mongoView.LimitRange(limit, next, args...)
+func (m *mongoModel) ScanN(limit int64, next data.ScanFunc, args ...Any) Res {
+	return m.mongoView.ScanN(limit, next, args...)
 }
-func (m *mongoModel) Limit(offset, limit int64, args ...Any) (int64, []Map) {
-	return m.mongoView.Limit(offset, limit, args...)
-}
-func (m *mongoModel) Page(offset, limit int64, args ...Any) data.PageResult {
-	return m.mongoView.Page(offset, limit, args...)
+func (m *mongoModel) Slice(offset, limit int64, args ...Any) (int64, []Map) {
+	return m.mongoView.Slice(offset, limit, args...)
 }
 
 func (v *mongoView) queryWithQuery(q data.Query) ([]Map, error) {
@@ -1019,7 +1652,7 @@ func (v *mongoView) queryWithQuery(q data.Query) ([]Map, error) {
 		if err := cur.Decode(&m); err != nil {
 			return nil, err
 		}
-		out = append(out, bsonToMap(m))
+		out = append(out, v.base.toAppMap(bsonToMap(m)))
 	}
 	if err := cur.Err(); err != nil {
 		return nil, err
@@ -1156,7 +1789,7 @@ func (v *mongoView) aggregateWithQuery(q data.Query) ([]Map, error) {
 				flat[k] = normalizeBsonValue(v)
 			}
 		}
-		out = append(out, flat)
+		out = append(out, v.base.toAppMap(flat))
 	}
 	if err := cur.Err(); err != nil {
 		return nil, err
@@ -1267,45 +1900,51 @@ func cmpToFilter(c data.CmpExpr) (bson.M, error) {
 	}
 }
 
-func buildUpdateDoc(input Map) bson.M {
+func buildUpdateDoc(base *mongoBase, input Map) bson.M {
 	setPart := bson.M{}
 	incPart := bson.M{}
 	unsetPart := bson.M{}
 	pushPart := bson.M{}
 	pullPart := bson.M{}
 	addSetPart := bson.M{}
+	field := func(name string) string {
+		if base == nil {
+			return name
+		}
+		return base.storageField(name)
+	}
 
 	for k, v := range input {
 		switch k {
 		case data.UpdSet:
 			if m, ok := v.(Map); ok {
 				for kk, vv := range m {
-					setPart[kk] = vv
+					setPart[field(kk)] = vv
 				}
 			}
 		case data.UpdInc:
 			if m, ok := v.(Map); ok {
 				for kk, vv := range m {
-					incPart[kk] = vv
+					incPart[field(kk)] = vv
 				}
 			}
 		case data.UpdUnset:
 			switch vv := v.(type) {
 			case string:
-				unsetPart[vv] = ""
+				unsetPart[field(vv)] = ""
 			case []string:
 				for _, one := range vv {
-					unsetPart[one] = ""
+					unsetPart[field(one)] = ""
 				}
 			case []Any:
 				for _, one := range vv {
 					if s, ok := one.(string); ok {
-						unsetPart[s] = ""
+						unsetPart[field(s)] = ""
 					}
 				}
 			case Map:
 				for kk := range vv {
-					unsetPart[kk] = ""
+					unsetPart[field(kk)] = ""
 				}
 			}
 		case data.UpdPush:
@@ -1313,9 +1952,9 @@ func buildUpdateDoc(input Map) bson.M {
 				for kk, vv := range m {
 					arr := toAnySlice(vv)
 					if len(arr) > 1 {
-						pushPart[kk] = bson.M{"$each": arr}
+						pushPart[field(kk)] = bson.M{"$each": arr}
 					} else if len(arr) == 1 {
-						pushPart[kk] = arr[0]
+						pushPart[field(kk)] = arr[0]
 					}
 				}
 			}
@@ -1324,9 +1963,9 @@ func buildUpdateDoc(input Map) bson.M {
 				for kk, vv := range m {
 					arr := toAnySlice(vv)
 					if len(arr) > 1 {
-						pullPart[kk] = bson.M{"$in": arr}
+						pullPart[field(kk)] = bson.M{"$in": arr}
 					} else if len(arr) == 1 {
-						pullPart[kk] = arr[0]
+						pullPart[field(kk)] = arr[0]
 					}
 				}
 			}
@@ -1335,36 +1974,36 @@ func buildUpdateDoc(input Map) bson.M {
 				for kk, vv := range m {
 					arr := toAnySlice(vv)
 					if len(arr) > 1 {
-						addSetPart[kk] = bson.M{"$each": arr}
+						addSetPart[field(kk)] = bson.M{"$each": arr}
 					} else if len(arr) == 1 {
-						addSetPart[kk] = arr[0]
+						addSetPart[field(kk)] = arr[0]
 					}
 				}
 			}
 		case data.UpdSetPath:
 			if m, ok := v.(Map); ok {
 				for kk, vv := range m {
-					setPart[kk] = vv
+					setPart[field(kk)] = vv
 				}
 			}
 		case data.UpdUnsetPath:
 			switch vv := v.(type) {
 			case string:
-				unsetPart[vv] = ""
+				unsetPart[field(vv)] = ""
 			case []string:
 				for _, one := range vv {
-					unsetPart[one] = ""
+					unsetPart[field(one)] = ""
 				}
 			case []Any:
 				for _, one := range vv {
 					if s, ok := one.(string); ok {
-						unsetPart[s] = ""
+						unsetPart[field(s)] = ""
 					}
 				}
 			}
 		default:
 			if !strings.HasPrefix(k, "$") {
-				setPart[k] = v
+				setPart[field(k)] = v
 			}
 		}
 	}
@@ -1779,6 +2418,22 @@ func parseBool(v Any) (bool, bool) {
 		}
 	}
 	return false, false
+}
+
+func mongoErrorModeFromSetting(setting Map) string {
+	mode := "auto-clear"
+	if setting == nil {
+		return mode
+	}
+	if raw, ok := setting["errorMode"]; ok {
+		if s, ok := raw.(string); ok {
+			v := strings.ToLower(strings.TrimSpace(s))
+			if v == "sticky" || v == "auto-clear" {
+				return v
+			}
+		}
+	}
+	return mode
 }
 
 func cloneMap(in Map) Map {
