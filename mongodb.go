@@ -8,6 +8,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	. "github.com/bamgoo/base"
@@ -33,6 +34,8 @@ type (
 		mutex sync.RWMutex
 		err   error
 		mode  string
+		ctx   context.Context
+		tmo   time.Duration
 		txCtx mongo.SessionContext
 		txSes mongo.Session
 	}
@@ -57,6 +60,15 @@ type (
 		mongoView
 	}
 )
+
+type mongoCacheValue struct {
+	expireAt int64
+	items    []Map
+	total    int64
+}
+
+var mongoCacheRegistry sync.Map
+var mongoCacheCount sync.Map
 
 func (b *mongoBase) fieldMappingEnabled() bool {
 	return b != nil && b.inst != nil && b.inst.Config.Mapping
@@ -238,7 +250,14 @@ func (c *mongodbConnection) Open() error {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	cli, err := mongo.Connect(ctx, options.Client().ApplyURI(dsn))
+	clientOpt := options.Client().ApplyURI(dsn)
+	if c.instance.Config.MaxOpen > 0 {
+		clientOpt.SetMaxPoolSize(uint64(c.instance.Config.MaxOpen))
+	}
+	if c.instance.Config.MaxIdleTime > 0 {
+		clientOpt.SetMaxConnIdleTime(c.instance.Config.MaxIdleTime)
+	}
+	cli, err := mongo.Connect(ctx, clientOpt)
 	if err != nil {
 		return err
 	}
@@ -284,6 +303,21 @@ func (mongoDialect) SupportsILike() bool      { return true }
 func (mongoDialect) SupportsReturning() bool  { return true }
 func (b *mongoBase) Capabilities() data.Capabilities {
 	return data.Capabilities{Dialect: "mongodb", ILike: true, Returning: true, Join: true, Group: true, Having: true, Aggregate: true, KeysetAfter: true, JsonContains: true, ArrayOverlap: true, JsonElemMatch: true}
+}
+func (b *mongoBase) WithContext(ctx context.Context) data.DataBase {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	b.mutex.Lock()
+	b.ctx = ctx
+	b.mutex.Unlock()
+	return b
+}
+func (b *mongoBase) WithTimeout(timeout time.Duration) data.DataBase {
+	b.mutex.Lock()
+	b.tmo = timeout
+	b.mutex.Unlock()
+	return b
 }
 func (b *mongoBase) Begin() error {
 	b.mutex.RLock()
@@ -413,10 +447,17 @@ func (b *mongoBase) ClearError() { b.setError(nil) }
 func (b *mongoBase) opContext(timeout time.Duration) (context.Context, context.CancelFunc) {
 	b.mutex.RLock()
 	sc := b.txCtx
+	base := b.ctx
+	tmo := b.tmo
 	b.mutex.RUnlock()
-	base := context.Background()
+	if base == nil {
+		base = context.Background()
+	}
 	if sc != nil {
 		base = sc
+	}
+	if tmo > 0 {
+		timeout = tmo
 	}
 	if timeout > 0 {
 		return context.WithTimeout(base, timeout)
@@ -481,6 +522,12 @@ func (b *mongoBase) Raw(query string, args ...Any) []Map {
 func (b *mongoBase) Exec(query string, args ...Any) int64 {
 	cmd := strings.TrimSpace(query)
 	lower := strings.ToLower(cmd)
+	if isWriteMongoCommand(lower) {
+		if err := b.ensureWritable("exec"); err != nil {
+			b.setError(err)
+			return 0
+		}
+	}
 	ctx, cancel := b.opContext(20 * time.Second)
 	defer cancel()
 	switch {
@@ -598,6 +645,43 @@ func (b *mongoBase) Exec(query string, args ...Any) int64 {
 	}
 }
 
+func (b *mongoBase) ensureWritable(op string) error {
+	if b == nil || b.inst == nil {
+		return nil
+	}
+	if b.inst.Config.ReadOnly || isReadOnlyMongoSetting(b.inst.Config.Setting) {
+		return data.Error(op, data.ErrValidation, fmt.Errorf("readonly data connection: %s", b.inst.Name))
+	}
+	return nil
+}
+
+func isReadOnlyMongoSetting(setting Map) bool {
+	if setting == nil {
+		return false
+	}
+	for _, key := range []string{"readOnly", "readonly"} {
+		if raw, ok := setting[key]; ok {
+			if vv, ok := parseBool(raw); ok && vv {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func isWriteMongoCommand(cmd string) bool {
+	switch {
+	case strings.HasPrefix(cmd, "createcollection "),
+		strings.HasPrefix(cmd, "dropcollection "),
+		strings.HasPrefix(cmd, "deletemany "),
+		strings.HasPrefix(cmd, "updatemany "),
+		strings.HasPrefix(cmd, "insertmany "):
+		return true
+	default:
+		return false
+	}
+}
+
 func (b *mongoBase) Command(cmd Any) Map {
 	command, err := parseCommand("command", cmd)
 	if err != nil {
@@ -711,6 +795,10 @@ func (b *mongoBase) AggregateRaw(collection string, pipeline Any) []Map {
 }
 
 func (b *mongoBase) Migrate(names ...string) {
+	if err := b.ensureWritable("migrate"); err != nil {
+		b.setError(err)
+		return
+	}
 	_, _ = b.migrateWith(names, data.MigrateOptions{})
 }
 
@@ -725,18 +813,34 @@ func (b *mongoBase) MigrateDiff(names ...string) data.MigrateReport {
 }
 
 func (b *mongoBase) MigrateUp(versions ...string) {
+	if err := b.ensureWritable("migrate.up"); err != nil {
+		b.setError(err)
+		return
+	}
 	b.setError(b.runVersionedUp(versions...))
 }
 
 func (b *mongoBase) MigrateDown(steps int) {
+	if err := b.ensureWritable("migrate.down"); err != nil {
+		b.setError(err)
+		return
+	}
 	b.setError(b.runVersionedDown(steps))
 }
 
 func (b *mongoBase) MigrateTo(version string) {
+	if err := b.ensureWritable("migrate.to"); err != nil {
+		b.setError(err)
+		return
+	}
 	b.setError(b.runVersionedTo(version))
 }
 
 func (b *mongoBase) MigrateDownTo(version string) {
+	if err := b.ensureWritable("migrate.downTo"); err != nil {
+		b.setError(err)
+		return
+	}
 	b.setError(b.runVersionedDownTo(version))
 }
 
@@ -822,6 +926,7 @@ func (b *mongoBase) migrateWith(names []string, override data.MigrateOptions) (d
 				Kind:   "create_collection",
 				Target: source,
 				Apply:  !opts.DryRun,
+				Risk:   "low",
 			})
 			if !opts.DryRun {
 				if err := b.migrateRetry(opts, func() error { return b.conn.db.CreateCollection(ctx, source) }); err != nil {
@@ -851,6 +956,7 @@ func (b *mongoBase) migrateWith(names []string, override data.MigrateOptions) (d
 				Kind:   "create_index",
 				Target: name,
 				Apply:  !opts.DryRun,
+				Risk:   "low",
 			})
 			if !opts.DryRun {
 				if err := b.migrateRetry(opts, func() error {
@@ -1018,13 +1124,30 @@ func (b *mongoBase) runVersionedDownTo(target string) error {
 	if target == "" {
 		return fmt.Errorf("empty migrate down target version")
 	}
+	all := data.Migrations(b.inst.Name)
+	indexes := map[string]int{}
+	targetIdx := -1
+	for i, mg := range all {
+		v := strings.TrimSpace(mg.Version)
+		indexes[v] = i
+		if v == target {
+			targetIdx = i
+		}
+	}
+	if targetIdx < 0 {
+		return fmt.Errorf("migration target version not found: %s", target)
+	}
 	applied, err := b.loadVersionAppliedOrderedDesc()
 	if err != nil {
 		return err
 	}
 	steps := 0
 	for _, v := range applied {
-		if v > target {
+		idx, ok := indexes[v]
+		if !ok {
+			return fmt.Errorf("migration version not registered: %s", v)
+		}
+		if idx > targetIdx {
 			steps++
 		}
 	}
@@ -1266,7 +1389,11 @@ func (b *mongoBase) Model(name string) data.DataModel {
 
 func (t *mongoTable) coll() *mongo.Collection { return t.base.conn.db.Collection(t.source) }
 
-func (t *mongoTable) Create(dataIn Map) Map {
+func (t *mongoTable) Insert(dataIn Map) Map {
+	if err := t.base.ensureWritable(t.name + ".insert"); err != nil {
+		t.base.setError(err)
+		return nil
+	}
 	ctx, cancel := t.base.opContext(10 * time.Second)
 	defer cancel()
 	doc := bson.M(t.base.toStorageMap(dataIn))
@@ -1279,11 +1406,17 @@ func (t *mongoTable) Create(dataIn Map) Map {
 	if _, ok := out[t.key]; !ok {
 		out[t.key] = res.InsertedID
 	}
+	data.TouchTableCache(t.base.inst.Name, t.source)
+	data.EmitMutation(t.base.inst.Name, t.source, data.MutationInsert, 1, out[t.key], out, nil)
 	t.base.setError(nil)
 	return out
 }
 
-func (t *mongoTable) CreateMany(items []Map) []Map {
+func (t *mongoTable) InsertMany(items []Map) []Map {
+	if err := t.base.ensureWritable(t.name + ".insertMany"); err != nil {
+		t.base.setError(err)
+		return nil
+	}
 	if len(items) == 0 {
 		t.base.setError(nil)
 		return []Map{}
@@ -1307,11 +1440,17 @@ func (t *mongoTable) CreateMany(items []Map) []Map {
 		}
 		out = append(out, m)
 	}
+	data.TouchTableCache(t.base.inst.Name, t.source)
+	data.EmitMutation(t.base.inst.Name, t.source, data.MutationInsert, int64(len(out)), nil, nil, nil)
 	t.base.setError(nil)
 	return out
 }
 
 func (t *mongoTable) Upsert(dataIn Map, args ...Any) Map {
+	if err := t.base.ensureWritable(t.name + ".upsert"); err != nil {
+		t.base.setError(err)
+		return nil
+	}
 	filter := make(Map)
 	if len(args) > 0 {
 		if m, ok := args[0].(Map); ok {
@@ -1326,7 +1465,11 @@ func (t *mongoTable) Upsert(dataIn Map, args ...Any) Map {
 		}
 	}
 	if len(filter) == 0 {
-		return t.Create(dataIn)
+		out := t.Insert(dataIn)
+		if t.base.Error() == nil && out != nil {
+			data.EmitMutation(t.base.inst.Name, t.source, data.MutationUpsert, 1, out[t.key], nil, filter)
+		}
+		return out
 	}
 	upd := buildUpdateDoc(t.base, dataIn)
 	ctx, cancel := t.base.opContext(10 * time.Second)
@@ -1336,11 +1479,17 @@ func (t *mongoTable) Upsert(dataIn Map, args ...Any) Map {
 		t.base.setError(err)
 		return nil
 	}
+	data.TouchTableCache(t.base.inst.Name, t.source)
+	data.EmitMutation(t.base.inst.Name, t.source, data.MutationUpsert, 1, nil, nil, filter)
 	out := t.First(filter)
 	return out
 }
 
 func (t *mongoTable) UpsertMany(items []Map, args ...Any) []Map {
+	if err := t.base.ensureWritable(t.name + ".upsertMany"); err != nil {
+		t.base.setError(err)
+		return nil
+	}
 	out := make([]Map, 0, len(items))
 	for _, item := range items {
 		one := t.Upsert(item, args...)
@@ -1354,6 +1503,10 @@ func (t *mongoTable) UpsertMany(items []Map, args ...Any) []Map {
 }
 
 func (t *mongoTable) Change(item Map, dataIn Map) Map {
+	if err := t.base.ensureWritable(t.name + ".change"); err != nil {
+		t.base.setError(err)
+		return nil
+	}
 	if item == nil || item[t.key] == nil {
 		t.base.setError(fmt.Errorf("missing primary key %s", t.key))
 		return nil
@@ -1366,10 +1519,16 @@ func (t *mongoTable) Change(item Map, dataIn Map) Map {
 		t.base.setError(err)
 		return nil
 	}
+	data.TouchTableCache(t.base.inst.Name, t.source)
+	data.EmitMutation(t.base.inst.Name, t.source, data.MutationUpdate, 1, item[t.key], dataIn, Map{t.key: item[t.key]})
 	return t.First(Map{t.key: item[t.key]})
 }
 
 func (t *mongoTable) Remove(args ...Any) Map {
+	if err := t.base.ensureWritable(t.name + ".remove"); err != nil {
+		t.base.setError(err)
+		return nil
+	}
 	item := t.First(args...)
 	if t.base.Error() != nil || item == nil {
 		return nil
@@ -1381,11 +1540,17 @@ func (t *mongoTable) Remove(args ...Any) Map {
 		t.base.setError(err)
 		return nil
 	}
+	data.TouchTableCache(t.base.inst.Name, t.source)
+	data.EmitMutation(t.base.inst.Name, t.source, data.MutationDelete, 1, item[t.key], nil, Map{t.key: item[t.key]})
 	t.base.setError(nil)
 	return item
 }
 
 func (t *mongoTable) Update(sets Map, args ...Any) int64 {
+	if err := t.base.ensureWritable(t.name + ".update"); err != nil {
+		t.base.setError(err)
+		return 0
+	}
 	q, err := data.Parse(args...)
 	if err != nil {
 		t.base.setError(err)
@@ -1404,11 +1569,17 @@ func (t *mongoTable) Update(sets Map, args ...Any) int64 {
 		t.base.setError(err)
 		return 0
 	}
+	data.TouchTableCache(t.base.inst.Name, t.source)
+	data.EmitMutation(t.base.inst.Name, t.source, data.MutationUpdate, res.ModifiedCount, nil, sets, nil)
 	t.base.setError(nil)
 	return res.ModifiedCount
 }
 
 func (t *mongoTable) Delete(args ...Any) int64 {
+	if err := t.base.ensureWritable(t.name + ".delete"); err != nil {
+		t.base.setError(err)
+		return 0
+	}
 	q, err := data.Parse(args...)
 	if err != nil {
 		t.base.setError(err)
@@ -1427,6 +1598,8 @@ func (t *mongoTable) Delete(args ...Any) int64 {
 		t.base.setError(err)
 		return 0
 	}
+	data.TouchTableCache(t.base.inst.Name, t.source)
+	data.EmitMutation(t.base.inst.Name, t.source, data.MutationDelete, res.DeletedCount, nil, nil, nil)
 	t.base.setError(nil)
 	return res.DeletedCount
 }
@@ -1458,6 +1631,10 @@ func (v *mongoView) Count(args ...Any) int64 {
 		return 0
 	}
 	q = v.base.mapQueryToStorage(q)
+	if total, ok := v.loadCountCache(q); ok {
+		v.base.setError(nil)
+		return total
+	}
 	filter, err := exprToFilter(q.Filter)
 	if err != nil {
 		v.base.setError(err)
@@ -1470,6 +1647,7 @@ func (v *mongoView) Count(args ...Any) int64 {
 		v.base.setError(err)
 		return 0
 	}
+	v.storeCountCache(q, total)
 	v.base.setError(nil)
 	return total
 }
@@ -1538,6 +1716,45 @@ func (v *mongoView) ScanN(limit int64, next data.ScanFunc, args ...Any) Res {
 	q = v.base.mapQueryToStorage(q)
 	if limit > 0 {
 		q.Limit = limit
+	}
+	batch := q.Batch
+	if batch <= 0 {
+		batch = v.base.scanBatchSize()
+	}
+	if batch > 0 {
+		offset := q.Offset
+		remain := q.Limit
+		for {
+			chunk := batch
+			if remain > 0 && chunk > remain {
+				chunk = remain
+			}
+			qq := q
+			qq.Offset = offset
+			qq.Limit = chunk
+			items, err := v.queryWithQuery(qq)
+			if err != nil {
+				v.base.setError(err)
+				return nil
+			}
+			for _, item := range items {
+				if res := next(item); res != nil && res.Fail() {
+					return res
+				}
+			}
+			if len(items) == 0 || int64(len(items)) < chunk {
+				break
+			}
+			offset += int64(len(items))
+			if remain > 0 {
+				remain -= int64(len(items))
+				if remain <= 0 {
+					break
+				}
+			}
+		}
+		v.base.setError(nil)
+		return nil
 	}
 	items, err := v.queryWithQuery(q)
 	if err != nil {
@@ -1610,6 +1827,9 @@ func (v *mongoView) queryWithQuery(q data.Query) ([]Map, error) {
 		return v.aggregateWithQuery(q)
 	}
 	q = applyAfter(q)
+	if items, ok := v.loadQueryCache(q); ok {
+		return items, nil
+	}
 	filter, err := exprToFilter(q.Filter)
 	if err != nil {
 		return nil, err
@@ -1639,6 +1859,9 @@ func (v *mongoView) queryWithQuery(q data.Query) ([]Map, error) {
 	if q.Limit > 0 {
 		findOpts.SetLimit(q.Limit)
 	}
+	if q.Batch > 0 {
+		findOpts.SetBatchSize(int32(q.Batch))
+	}
 	ctx, cancel := v.base.opContext(15 * time.Second)
 	defer cancel()
 	cur, err := v.coll().Find(ctx, filter, findOpts)
@@ -1657,7 +1880,94 @@ func (v *mongoView) queryWithQuery(q data.Query) ([]Map, error) {
 	if err := cur.Err(); err != nil {
 		return nil, err
 	}
+	v.storeQueryCache(q, out)
 	return out, nil
+}
+
+func (v *mongoView) loadQueryCache(q data.Query) ([]Map, bool) {
+	if v == nil || v.base == nil || !v.base.cacheEnabled() {
+		return nil, false
+	}
+	token := data.CacheToken(v.base.inst.Name, v.cacheTables(q))
+	key := "q:" + token + ":" + data.QuerySignature(q)
+	raw, ok := mongoCacheMap(v.base.inst.Name).Load(key)
+	if !ok {
+		return nil, false
+	}
+	cv, ok := raw.(mongoCacheValue)
+	if !ok {
+		return nil, false
+	}
+	if cv.expireAt > 0 && time.Now().UnixNano() > cv.expireAt {
+		mongoCacheDelete(v.base.inst.Name, key)
+		return nil, false
+	}
+	return cloneMaps(cv.items), true
+}
+
+func (v *mongoView) storeQueryCache(q data.Query, items []Map) {
+	if v == nil || v.base == nil || !v.base.cacheEnabled() {
+		return
+	}
+	ttl := v.base.cacheTTL()
+	if ttl <= 0 {
+		return
+	}
+	token := data.CacheToken(v.base.inst.Name, v.cacheTables(q))
+	key := "q:" + token + ":" + data.QuerySignature(q)
+	mongoCacheStore(v.base.inst.Name, key, mongoCacheValue{
+		expireAt: time.Now().Add(ttl).UnixNano(),
+		items:    cloneMaps(items),
+		total:    -1,
+	}, v.base.cacheCapacity())
+}
+
+func (v *mongoView) loadCountCache(q data.Query) (int64, bool) {
+	if v == nil || v.base == nil || !v.base.cacheEnabled() {
+		return 0, false
+	}
+	token := data.CacheToken(v.base.inst.Name, v.cacheTables(q))
+	key := "c:" + token + ":" + data.QuerySignature(q)
+	raw, ok := mongoCacheMap(v.base.inst.Name).Load(key)
+	if !ok {
+		return 0, false
+	}
+	cv, ok := raw.(mongoCacheValue)
+	if !ok {
+		return 0, false
+	}
+	if cv.expireAt > 0 && time.Now().UnixNano() > cv.expireAt {
+		mongoCacheDelete(v.base.inst.Name, key)
+		return 0, false
+	}
+	return cv.total, true
+}
+
+func (v *mongoView) storeCountCache(q data.Query, total int64) {
+	if v == nil || v.base == nil || !v.base.cacheEnabled() {
+		return
+	}
+	ttl := v.base.cacheTTL()
+	if ttl <= 0 {
+		return
+	}
+	token := data.CacheToken(v.base.inst.Name, v.cacheTables(q))
+	key := "c:" + token + ":" + data.QuerySignature(q)
+	mongoCacheStore(v.base.inst.Name, key, mongoCacheValue{
+		expireAt: time.Now().Add(ttl).UnixNano(),
+		total:    total,
+	}, v.base.cacheCapacity())
+}
+
+func (v *mongoView) cacheTables(q data.Query) []string {
+	out := make([]string, 0, len(q.Joins)+1)
+	out = append(out, v.source)
+	for _, join := range q.Joins {
+		if strings.TrimSpace(join.From) != "" {
+			out = append(out, join.From)
+		}
+	}
+	return out
 }
 
 func (v *mongoView) aggregateWithQuery(q data.Query) ([]Map, error) {
@@ -2434,6 +2744,167 @@ func mongoErrorModeFromSetting(setting Map) string {
 		}
 	}
 	return mode
+}
+
+func (b *mongoBase) scanBatchSize() int64 {
+	if b == nil || b.inst == nil || b.inst.Config.Setting == nil {
+		return 0
+	}
+	for _, key := range []string{"scanBatch", "scan_batch"} {
+		if raw, ok := b.inst.Config.Setting[key]; ok {
+			if vv, ok := parseInt64(raw); ok && vv > 0 {
+				return vv
+			}
+		}
+	}
+	return 0
+}
+
+func (b *mongoBase) cacheEnabled() bool {
+	if b == nil || b.inst == nil || b.inst.Config.Setting == nil {
+		return false
+	}
+	raw, ok := b.inst.Config.Setting["cache"]
+	if !ok {
+		return false
+	}
+	switch vv := raw.(type) {
+	case bool:
+		return vv
+	case int:
+		return vv > 0
+	case int64:
+		return vv > 0
+	case string:
+		vv = strings.TrimSpace(strings.ToLower(vv))
+		return vv == "true" || vv == "1" || vv == "yes"
+	case Map:
+		if e, ok := vv["enable"]; ok {
+			if yes, ok := parseBool(e); ok {
+				return yes
+			}
+		}
+		return true
+	default:
+		return false
+	}
+}
+
+func (b *mongoBase) cacheTTL() time.Duration {
+	if b == nil || b.inst == nil || b.inst.Config.Setting == nil {
+		return 0
+	}
+	raw, ok := b.inst.Config.Setting["cache"]
+	if !ok {
+		return 0
+	}
+	switch vv := raw.(type) {
+	case Map:
+		if d, ok := vv["ttl"]; ok {
+			switch dt := d.(type) {
+			case string:
+				parsed, err := time.ParseDuration(strings.TrimSpace(dt))
+				if err == nil && parsed > 0 {
+					return parsed
+				}
+			case int:
+				if dt > 0 {
+					return time.Second * time.Duration(dt)
+				}
+			case int64:
+				if dt > 0 {
+					return time.Second * time.Duration(dt)
+				}
+			}
+		}
+	}
+	return 3 * time.Second
+}
+
+func (b *mongoBase) cacheCapacity() int {
+	if b == nil || b.inst == nil || b.inst.Config.Setting == nil {
+		return 0
+	}
+	raw, ok := b.inst.Config.Setting["cache"]
+	if !ok {
+		return 0
+	}
+	if vv, ok := raw.(Map); ok {
+		for _, key := range []string{"capacity", "cap", "max"} {
+			if c, ok := vv[key]; ok {
+				if n, yes := parseInt64(c); yes && n > 0 {
+					return int(n)
+				}
+			}
+		}
+	}
+	return 0
+}
+
+func mongoCacheMap(name string) *sync.Map {
+	if strings.TrimSpace(name) == "" {
+		name = "default"
+	}
+	if v, ok := mongoCacheRegistry.Load(name); ok {
+		return v.(*sync.Map)
+	}
+	m := &sync.Map{}
+	actual, _ := mongoCacheRegistry.LoadOrStore(name, m)
+	return actual.(*sync.Map)
+}
+
+func mongoCacheCountPtr(name string) *atomic.Int64 {
+	if strings.TrimSpace(name) == "" {
+		name = "default"
+	}
+	if v, ok := mongoCacheCount.Load(name); ok {
+		return v.(*atomic.Int64)
+	}
+	p := &atomic.Int64{}
+	actual, _ := mongoCacheCount.LoadOrStore(name, p)
+	return actual.(*atomic.Int64)
+}
+
+func mongoCacheDelete(name, key string) {
+	if _, ok := mongoCacheMap(name).LoadAndDelete(key); ok {
+		mongoCacheCountPtr(name).Add(-1)
+	}
+}
+
+func mongoCacheStore(name, key string, val mongoCacheValue, capacity int) {
+	if _, loaded := mongoCacheMap(name).Load(key); !loaded {
+		mongoCacheCountPtr(name).Add(1)
+	}
+	mongoCacheMap(name).Store(key, val)
+	if capacity <= 0 {
+		return
+	}
+	for {
+		if mongoCacheCountPtr(name).Load() <= int64(capacity) {
+			break
+		}
+		removed := false
+		mongoCacheMap(name).Range(func(k, _ any) bool {
+			s, ok := k.(string)
+			if !ok || strings.TrimSpace(s) == "" {
+				return true
+			}
+			mongoCacheDelete(name, s)
+			removed = true
+			return false
+		})
+		if !removed {
+			break
+		}
+	}
+}
+
+func cloneMaps(items []Map) []Map {
+	out := make([]Map, 0, len(items))
+	for _, item := range items {
+		out = append(out, cloneMap(item))
+	}
+	return out
 }
 
 func cloneMap(in Map) Map {

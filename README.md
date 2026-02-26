@@ -38,7 +38,7 @@ errorMode = "auto-clear" # or sticky
 
 ## 支持能力
 
-- CRUD：`Create / CreateMany / Upsert / UpsertMany / Change / Remove / Update / Delete`
+- CRUD：`Insert / InsertMany / Upsert / UpsertMany / Change / Remove / Update / Delete`
 - 查询：`Query / First / Count / Aggregate / Group / Slice / Scan / ScanN`
 - DSL：比较、逻辑、`$contains/$overlap/$elemMatch`、`$after`、`$group/$agg/$having`
 - 更新：`$set/$inc/$unset/$push/$pull/$addToSet/$setPath/$unsetPath`
