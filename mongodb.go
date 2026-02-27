@@ -425,6 +425,10 @@ func (b *mongoBase) Tx(fn data.TxFunc) error {
 	b.setError(err)
 	return err
 }
+
+func (b *mongoBase) TxReadOnly(fn data.TxFunc) error {
+	return b.Tx(fn)
+}
 func (b *mongoBase) setError(err error) {
 	b.mutex.Lock()
 	if err == nil && b.mode == "sticky" {
@@ -1406,6 +1410,13 @@ func (t *mongoTable) Insert(dataIn Map) Map {
 	if _, ok := out[t.key]; !ok {
 		out[t.key] = res.InsertedID
 	}
+	if out[t.key] != nil {
+		if entity := t.First(Map{t.key: out[t.key]}); t.base.Error() == nil && entity != nil {
+			out = entity
+		} else {
+			t.base.setError(nil)
+		}
+	}
 	data.TouchTableCache(t.base.inst.Name, t.source)
 	data.EmitMutation(t.base.inst.Name, t.source, data.MutationInsert, 1, out[t.key], out, nil)
 	t.base.setError(nil)
@@ -1779,6 +1790,12 @@ func (v *mongoView) Slice(offset, limit int64, args ...Any) (int64, []Map) {
 	q = v.base.mapQueryToStorage(q)
 	q.Offset = offset
 	q.Limit = limit
+	if len(q.Sort) == 0 {
+		key := strings.TrimSpace(v.base.storageField(v.key))
+		if key != "" {
+			q.Sort = []data.Sort{{Field: key}}
+		}
+	}
 	total := v.Count(args...)
 	if v.base.Error() != nil {
 		return 0, nil
@@ -2167,29 +2184,29 @@ func cmpToFilter(c data.CmpExpr) (bson.M, error) {
 	field := c.Field
 	value := c.Value
 	switch c.Op {
-	case data.OpEq:
+	case OpEq:
 		return bson.M{field: normalizeCmpValue(value)}, nil
-	case data.OpNe:
+	case OpNe:
 		return bson.M{field: bson.M{"$ne": normalizeCmpValue(value)}}, nil
-	case data.OpGt:
+	case OpGt:
 		return bson.M{field: bson.M{"$gt": normalizeCmpValue(value)}}, nil
-	case data.OpGte:
+	case OpGte:
 		return bson.M{field: bson.M{"$gte": normalizeCmpValue(value)}}, nil
-	case data.OpLt:
+	case OpLt:
 		return bson.M{field: bson.M{"$lt": normalizeCmpValue(value)}}, nil
-	case data.OpLte:
+	case OpLte:
 		return bson.M{field: bson.M{"$lte": normalizeCmpValue(value)}}, nil
-	case data.OpIn:
+	case OpIn:
 		return bson.M{field: bson.M{"$in": toAnySlice(value)}}, nil
-	case data.OpNin:
+	case OpNin:
 		return bson.M{field: bson.M{"$nin": toAnySlice(value)}}, nil
-	case data.OpLike:
+	case OpLike:
 		return bson.M{field: primitive.Regex{Pattern: likeToRegex(fmt.Sprintf("%v", value)), Options: ""}}, nil
-	case data.OpILike:
+	case OpILike:
 		return bson.M{field: primitive.Regex{Pattern: likeToRegex(fmt.Sprintf("%v", value)), Options: "i"}}, nil
-	case data.OpRegex:
+	case OpRegex:
 		return bson.M{field: primitive.Regex{Pattern: fmt.Sprintf("%v", value), Options: "i"}}, nil
-	case data.OpContains:
+	case OpContains:
 		s := toAnySlice(value)
 		if len(s) > 0 {
 			return bson.M{field: bson.M{"$all": s}}, nil
@@ -2198,9 +2215,9 @@ func cmpToFilter(c data.CmpExpr) (bson.M, error) {
 			return bson.M{field: bson.M{"$all": []any{m}}}, nil
 		}
 		return bson.M{field: value}, nil
-	case data.OpOverlap:
+	case OpOverlap:
 		return bson.M{field: bson.M{"$in": toAnySlice(value)}}, nil
-	case data.OpElemMatch:
+	case OpElemMatch:
 		if m, ok := value.(Map); ok {
 			return bson.M{field: bson.M{"$elemMatch": bson.M(m)}}, nil
 		}
@@ -2226,19 +2243,19 @@ func buildUpdateDoc(base *mongoBase, input Map) bson.M {
 
 	for k, v := range input {
 		switch k {
-		case data.UpdSet:
+		case UpdSet:
 			if m, ok := v.(Map); ok {
 				for kk, vv := range m {
 					setPart[field(kk)] = vv
 				}
 			}
-		case data.UpdInc:
+		case UpdInc:
 			if m, ok := v.(Map); ok {
 				for kk, vv := range m {
 					incPart[field(kk)] = vv
 				}
 			}
-		case data.UpdUnset:
+		case UpdUnset:
 			switch vv := v.(type) {
 			case string:
 				unsetPart[field(vv)] = ""
@@ -2257,7 +2274,7 @@ func buildUpdateDoc(base *mongoBase, input Map) bson.M {
 					unsetPart[field(kk)] = ""
 				}
 			}
-		case data.UpdPush:
+		case UpdPush:
 			if m, ok := v.(Map); ok {
 				for kk, vv := range m {
 					arr := toAnySlice(vv)
@@ -2268,7 +2285,7 @@ func buildUpdateDoc(base *mongoBase, input Map) bson.M {
 					}
 				}
 			}
-		case data.UpdPull:
+		case UpdPull:
 			if m, ok := v.(Map); ok {
 				for kk, vv := range m {
 					arr := toAnySlice(vv)
@@ -2279,7 +2296,7 @@ func buildUpdateDoc(base *mongoBase, input Map) bson.M {
 					}
 				}
 			}
-		case data.UpdAddToSet:
+		case UpdAddToSet:
 			if m, ok := v.(Map); ok {
 				for kk, vv := range m {
 					arr := toAnySlice(vv)
@@ -2290,13 +2307,13 @@ func buildUpdateDoc(base *mongoBase, input Map) bson.M {
 					}
 				}
 			}
-		case data.UpdSetPath:
+		case UpdSetPath:
 			if m, ok := v.(Map); ok {
 				for kk, vv := range m {
 					setPart[field(kk)] = vv
 				}
 			}
-		case data.UpdUnsetPath:
+		case UpdUnsetPath:
 			switch vv := v.(type) {
 			case string:
 				unsetPart[field(vv)] = ""
@@ -2355,9 +2372,9 @@ func applyAfter(q data.Query) data.Query {
 	if !ok {
 		return q
 	}
-	op := data.OpGt
+	op := OpGt
 	if sf.Desc {
-		op = data.OpLt
+		op = OpLt
 	}
 	afterExpr := data.CmpExpr{Field: sf.Field, Op: op, Value: val}
 	if q.Filter == nil {
@@ -2430,17 +2447,17 @@ func exprToLookupExpr(expr data.Expr, localAliases []string, foreignAliases []st
 			return nil, err
 		}
 		switch e.Op {
-		case data.OpEq:
+		case OpEq:
 			return bson.M{"$eq": []Any{left, right}}, nil
-		case data.OpNe:
+		case OpNe:
 			return bson.M{"$ne": []Any{left, right}}, nil
-		case data.OpGt:
+		case OpGt:
 			return bson.M{"$gt": []Any{left, right}}, nil
-		case data.OpGte:
+		case OpGte:
 			return bson.M{"$gte": []Any{left, right}}, nil
-		case data.OpLt:
+		case OpLt:
 			return bson.M{"$lt": []Any{left, right}}, nil
-		case data.OpLte:
+		case OpLte:
 			return bson.M{"$lte": []Any{left, right}}, nil
 		default:
 			return nil, fmt.Errorf("unsupported join on operator %s", e.Op)

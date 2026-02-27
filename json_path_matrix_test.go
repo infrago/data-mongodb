@@ -3,13 +3,14 @@ package data_mongodb
 import (
 	"testing"
 
+	. "github.com/bamgoo/base"
 	"github.com/bamgoo/data"
 )
 
 func TestMongoJSONPathExprToFilter(t *testing.T) {
 	filter, err := exprToFilter(data.CmpExpr{
 		Field: "metadata.name",
-		Op:    data.OpEq,
+		Op:    OpEq,
 		Value: "alice",
 	})
 	if err != nil {
