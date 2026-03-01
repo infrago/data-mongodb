@@ -3,8 +3,8 @@ package data_mongodb
 import (
 	"fmt"
 
-	. "github.com/bamgoo/base"
-	"github.com/bamgoo/data"
+	. "github.com/infrago/base"
+	"github.com/infrago/data"
 )
 
 type RawExecutor interface {

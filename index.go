@@ -1,8 +1,8 @@
 package data_mongodb
 
 import (
-	"github.com/bamgoo/bamgoo"
-	"github.com/bamgoo/data"
+	"github.com/infrago/infra"
+	"github.com/infrago/data"
 )
 
 func Driver() data.Driver {
@@ -11,7 +11,7 @@ func Driver() data.Driver {
 
 func init() {
 	drv := Driver()
-	bamgoo.Register("mongodb", drv)
-	bamgoo.Register("mongo", drv)
-	bamgoo.Register("mgdb", drv)
+	infra.Register("mongodb", drv)
+	infra.Register("mongo", drv)
+	infra.Register("mgdb", drv)
 }

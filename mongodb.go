@@ -11,8 +11,8 @@ import (
 	"sync/atomic"
 	"time"
 
-	. "github.com/bamgoo/base"
-	"github.com/bamgoo/data"
+	. "github.com/infrago/base"
+	"github.com/infrago/data"
 	"go.mongodb.org/mongo-driver/bson"
 	"go.mongodb.org/mongo-driver/bson/primitive"
 	"go.mongodb.org/mongo-driver/mongo"
@@ -245,7 +245,7 @@ func (c *mongodbConnection) Open() error {
 		}
 	}
 	if dbName == "" {
-		dbName = "bamgoo"
+		dbName = "infrago"
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -1162,7 +1162,7 @@ func (b *mongoBase) runVersionedDownTo(target string) error {
 }
 
 func (b *mongoBase) acquireMigrateLock(opts data.MigrateOptions) (func(), error) {
-	lockColl := b.conn.db.Collection("_bamgoo_migrate_lock")
+	lockColl := b.conn.db.Collection("_infrago_migrate_lock")
 	key := b.inst.Name
 	deadline := time.Now().Add(opts.LockTimeout)
 	for {
@@ -1286,7 +1286,7 @@ func (b *mongoBase) loadIndexNames(ctx context.Context, source string) (map[stri
 }
 
 func (b *mongoBase) versionColl() *mongo.Collection {
-	return b.conn.db.Collection("_bamgoo_migrations_v2")
+	return b.conn.db.Collection("_infrago_migrations_v2")
 }
 
 func (b *mongoBase) loadVersionApplied() (map[string]string, error) {

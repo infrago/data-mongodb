@@ -5,15 +5,15 @@
 ## 安装
 
 ```bash
-go get github.com/bamgoo/data-mongodb
+go get github.com/infrago/data-mongodb
 ```
 
 ## 注册
 
 ```go
 import (
-    "github.com/bamgoo/data"
-    _ "github.com/bamgoo/data-mongodb"
+    "github.com/infrago/data"
+    _ "github.com/infrago/data-mongodb"
 )
 ```
 
