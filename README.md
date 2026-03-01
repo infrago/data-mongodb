@@ -1,193 +1,79 @@
 # data-mongodb
 
-`data` 模块的 MongoDB 驱动。
+`data-mongodb` 是 `data` 模块的 `mongodb` 驱动。
 
 ## 安装
 
 ```bash
-go get github.com/infrago/data-mongodb
+go get github.com/infrago/data@latest
+go get github.com/infrago/data-mongodb@latest
 ```
 
-## 注册
+## 接入
 
 ```go
 import (
-    "github.com/infrago/data"
+    _ "github.com/infrago/data"
     _ "github.com/infrago/data-mongodb"
+    "github.com/infrago/infra"
 )
+
+func main() {
+    infra.Run()
+}
 ```
 
-驱动名：
-
-- `mongodb`
-- `mongo`
-- `mgdb`
-
-## 配置
+## 配置示例
 
 ```toml
 [data]
 driver = "mongodb"
-url = "mongodb://127.0.0.1:27017"
-schema = "app" # MongoDB database 名
-
-[data.setting]
-database = "app" # schema 为空时可用这个
-errorMode = "auto-clear" # or sticky
 ```
 
-## 支持能力
+## 公开 API（摘自源码）
 
-- CRUD：`Insert / InsertMany / Upsert / UpsertMany / Change / Remove / Update / Delete`
-- 查询：`Query / First / Count / Aggregate / Group / Slice / Scan / ScanN`
-- DSL：比较、逻辑、`$contains/$overlap/$elemMatch`、`$after`、`$group/$agg/$having`
-- 更新：`$set/$inc/$unset/$push/$pull/$addToSet/$setPath/$unsetPath`
-- 事务：`Begin/Commit/Rollback/Tx`（Mongo Session Transaction）
-- Join：
-  - `localField + foreignField`
-  - `on` 表达式（lookup pipeline + $expr）
-- `Raw/Exec`：Mongo 命令模式
+- `func Driver() data.Driver`
+- `func (d *mongodbDriver) Connect(inst *data.Instance) (data.Connection, error)`
+- `func (c *mongodbConnection) Open() error`
+- `func (c *mongodbConnection) Close() error`
+- `func (c *mongodbConnection) Health() data.Health`
+- `func (c *mongodbConnection) DB() *sql.DB { return nil }`
+- `func (c *mongodbConnection) Dialect() data.Dialect { return mongoDialect{} }`
+- `func (c *mongodbConnection) Base(inst *data.Instance) data.DataBase`
+- `func (mongoDialect) Name() string             { return "mongodb" }`
+- `func (mongoDialect) Quote(s string) string    { return s }`
+- `func (mongoDialect) Placeholder(_ int) string { return "?" }`
+- `func (mongoDialect) SupportsILike() bool      { return true }`
+- `func (mongoDialect) SupportsReturning() bool  { return true }`
+- `func (b *mongoBase) Capabilities() data.Capabilities`
+- `func (b *mongoBase) WithContext(ctx context.Context) data.DataBase`
+- `func (b *mongoBase) WithTimeout(timeout time.Duration) data.DataBase`
+- `func (b *mongoBase) Begin() error`
+- `func (b *mongoBase) Commit() error`
+- `func (b *mongoBase) Rollback() error`
+- `func (b *mongoBase) Close() error`
+- `func (b *mongoBase) Tx(fn data.TxFunc) error`
+- `func (b *mongoBase) TxReadOnly(fn data.TxFunc) error`
+- `func (b *mongoBase) Error() error`
+- `func (b *mongoBase) ClearError() { b.setError(nil) }`
+- `func (b *mongoBase) Parse(args ...Any) (string, []Any)`
+- `func (b *mongoBase) Raw(query string, args ...Any) []Map`
+- `func (b *mongoBase) Exec(query string, args ...Any) int64`
+- `func (b *mongoBase) Command(cmd Any) Map`
+- `func (b *mongoBase) FindRaw(collection string, filter Any, opts ...Map) []Map`
+- `func (b *mongoBase) AggregateRaw(collection string, pipeline Any) []Map`
+- `func (b *mongoBase) Migrate(names ...string)`
+- `func (b *mongoBase) MigratePlan(names ...string) data.MigrateReport`
+- `func (b *mongoBase) MigrateDiff(names ...string) data.MigrateReport`
+- `func (b *mongoBase) MigrateUp(versions ...string)`
+- `func (b *mongoBase) MigrateDown(steps int)`
+- `func (b *mongoBase) MigrateTo(version string)`
+- `func (b *mongoBase) MigrateDownTo(version string)`
+- `func (b *mongoBase) Table(name string) data.DataTable`
+- `func (b *mongoBase) View(name string) data.DataView`
+- `func (b *mongoBase) Model(name string) data.DataModel`
 
-## 事务示例
+## 排错
 
-```go
-db := data.Base()
-defer db.Close()
-
-err := db.Tx(func(tx data.DataBase) error {
-    _ = tx.Table("wallet").Update(base.Map{
-        "$inc": base.Map{"balance": -100},
-    }, base.Map{"id": 1})
-    if tx.Error() != nil {
-        return tx.Error()
-    }
-
-    _ = tx.Table("wallet").Update(base.Map{
-        "$inc": base.Map{"balance": 100},
-    }, base.Map{"id": 2})
-    if tx.Error() != nil {
-        return tx.Error()
-    }
-
-    return nil
-})
-_ = err
-```
-
-## Join 示例
-
-### 1) localField / foreignField
-
-```go
-items := db.View("order").Query(base.Map{
-    "$join": []base.Map{
-        {
-            "from": "users",
-            "alias": "u",
-            "localField": "order.user_id",
-            "foreignField": "u.id",
-        },
-    },
-})
-_ = items
-```
-
-### 2) on 表达式
-
-```go
-items := db.View("order").Query(base.Map{
-    "$join": []base.Map{
-        {
-            "from": "users",
-            "alias": "u",
-            "on": base.Map{
-                "order.user_id": base.Map{"$eq": "$field:u.id"},
-            },
-        },
-    },
-})
-_ = items
-```
-
-## Raw 示例
-
-### aggregate
-
-```go
-rows := db.Raw("aggregate orders", []base.Map{
-    {"$match": base.Map{"status": "paid"}},
-    {"$group": base.Map{"_id": "$user_id", "total": base.Map{"$sum": "$amount"}}},
-})
-if db.Error() != nil {
-    // handle
-}
-_ = rows
-```
-
-## 标准化 Raw API（推荐）
-
-```go
-rows := data_mongodb.FindRaw(db, "users", base.Map{"status": "active"}, base.Map{
-  "sort": base.Map{"id": base.DESC},
-  "limit": 20,
-})
-if db.Error() != nil {
-  // handle
-}
-_ = rows
-```
-
-### find
-
-```go
-rows := db.Raw("find users",
-    base.Map{"status": "active"},
-    base.Map{"sort": base.Map{"id": -1}, "limit": 20},
-)
-_ = rows
-```
-
-### command
-
-```go
-rows := db.Raw("command", base.Map{"ping": 1})
-_ = rows
-```
-
-## Exec 示例
-
-```go
-_ = db.Exec("createCollection users")
-_ = db.Exec("insertMany users", []base.Map{{"id": 1, "name": "a"}, {"id": 2, "name": "b"}})
-_ = db.Exec("updateMany users", base.Map{"status": "active"}, base.Map{"$set": base.Map{"vip": true}})
-_ = db.Exec("deleteMany users", base.Map{"status": "deleted"})
-```
-
-## Parse 示例
-
-```go
-where, _ := db.Parse(base.Map{
-    "status": "active",
-    "age": base.Map{"$gte": 18},
-})
-// where 是 Mongo filter 的 JSON 字符串
-_ = where
-```
-
-## 错误处理
-
-驱动遵循 data 的 Error 风格：
-
-```go
-items := db.Table("user").Query(base.Map{"status": "active"})
-if db.Error() != nil {
-    // handle
-}
-_ = items
-```
-
-## 说明
-
-- `schema` 对应 MongoDB 的 database 名。
-- `Raw/Exec` 为 Mongo 命令风格，不是 SQL。
-- 事务要求 Mongo 部署支持事务（副本集/分片）。
+- driver 未生效：确认模块段 `driver` 值与驱动名一致
+- 连接失败：检查 endpoint/host/port/鉴权配置

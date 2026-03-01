@@ -23,6 +23,6 @@ require (
 	golang.org/x/text v0.28.0 // indirect
 )
 
-replace github.com/infrago/infra => ../infra
+replace github.com/infrago/infra => ../bamgoo
 
 replace github.com/infrago/data => ../data
