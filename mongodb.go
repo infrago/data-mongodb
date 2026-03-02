@@ -1482,7 +1482,8 @@ func (t *mongoTable) Upsert(dataIn Map, args ...Any) Map {
 		}
 		return out
 	}
-	upd := buildUpdateDoc(t.base, dataIn)
+	payload := t.withAutoUpdateStamp(dataIn)
+	upd := buildUpdateDoc(t.base, payload)
 	ctx, cancel := t.base.opContext(10 * time.Second)
 	defer cancel()
 	_, err := t.coll().UpdateOne(ctx, bson.M(filter), upd, options.Update().SetUpsert(true))
@@ -1522,7 +1523,8 @@ func (t *mongoTable) Change(item Map, dataIn Map) Map {
 		t.base.setError(fmt.Errorf("missing primary key %s", t.key))
 		return nil
 	}
-	upd := buildUpdateDoc(t.base, dataIn)
+	payload := t.withAutoUpdateStamp(dataIn)
+	upd := buildUpdateDoc(t.base, payload)
 	ctx, cancel := t.base.opContext(10 * time.Second)
 	defer cancel()
 	_, err := t.coll().UpdateOne(ctx, bson.M{t.base.storageField(t.key): item[t.key]}, upd)
@@ -1531,7 +1533,7 @@ func (t *mongoTable) Change(item Map, dataIn Map) Map {
 		return nil
 	}
 	data.TouchTableCache(t.base.inst.Name, t.source)
-	data.EmitMutation(t.base.inst.Name, t.source, data.MutationUpdate, 1, item[t.key], dataIn, Map{t.key: item[t.key]})
+	data.EmitMutation(t.base.inst.Name, t.source, data.MutationUpdate, 1, item[t.key], payload, Map{t.key: item[t.key]})
 	return t.First(Map{t.key: item[t.key]})
 }
 
@@ -1575,13 +1577,14 @@ func (t *mongoTable) Update(sets Map, args ...Any) int64 {
 	}
 	ctx, cancel := t.base.opContext(10 * time.Second)
 	defer cancel()
-	res, err := t.coll().UpdateMany(ctx, filter, buildUpdateDoc(t.base, sets))
+	payload := t.withAutoUpdateStamp(sets)
+	res, err := t.coll().UpdateMany(ctx, filter, buildUpdateDoc(t.base, payload))
 	if err != nil {
 		t.base.setError(err)
 		return 0
 	}
 	data.TouchTableCache(t.base.inst.Name, t.source)
-	data.EmitMutation(t.base.inst.Name, t.source, data.MutationUpdate, res.ModifiedCount, nil, sets, nil)
+	data.EmitMutation(t.base.inst.Name, t.source, data.MutationUpdate, res.ModifiedCount, nil, payload, nil)
 	t.base.setError(nil)
 	return res.ModifiedCount
 }
@@ -1631,6 +1634,48 @@ func (t *mongoTable) Slice(offset, limit int64, args ...Any) (int64, []Map) {
 }
 func (t *mongoTable) Group(field string, args ...Any) []Map {
 	return (*mongoView)(t).Group(field, args...)
+}
+
+func (t *mongoTable) withAutoUpdateStamp(input Map) Map {
+	field := t.autoUpdateFieldName()
+	if field == "" {
+		return input
+	}
+	out := Map{}
+	for k, v := range input {
+		out[k] = v
+	}
+	now := time.Now()
+	if rawSet, ok := out[UpdSet].(Map); ok && rawSet != nil {
+		setMap := Map{}
+		for k, v := range rawSet {
+			setMap[k] = v
+		}
+		setMap[field] = now
+		out[UpdSet] = setMap
+		return out
+	}
+	out[field] = now
+	return out
+}
+
+func (t *mongoTable) autoUpdateFieldName() string {
+	if len(t.fields) == 0 {
+		return ""
+	}
+	candidates := []string{"updatedAt", "changed", "updated_at"}
+	for _, name := range candidates {
+		if _, ok := t.fields[name]; ok {
+			return name
+		}
+	}
+	for key := range t.fields {
+		k := strings.ToLower(strings.TrimSpace(key))
+		if k == "updatedat" || k == "changed" || k == "updated_at" {
+			return key
+		}
+	}
+	return ""
 }
 
 func (v *mongoView) coll() *mongo.Collection { return v.base.conn.db.Collection(v.source) }
