@@ -74,6 +74,16 @@ func (b *mongoBase) fieldMappingEnabled() bool {
 	return b != nil && b.inst != nil && b.inst.Config.Mapping
 }
 
+func (b *mongoBase) watcherKeysEnabled() bool {
+	if b == nil || b.inst == nil || b.inst.Config.Watcher == nil {
+		return false
+	}
+	if v, ok := parseBool(b.inst.Config.Watcher["keys"]); ok {
+		return v
+	}
+	return false
+}
+
 func (b *mongoBase) storageField(field string) string {
 	field = strings.TrimSpace(field)
 	if field == "" || !b.fieldMappingEnabled() {
@@ -1418,7 +1428,11 @@ func (t *mongoTable) Insert(dataIn Map) Map {
 		}
 	}
 	data.TouchTableCache(t.base.inst.Name, t.source)
-	data.EmitMutation(t.base.inst.Name, t.source, data.MutationInsert, 1, out[t.key], out, nil)
+	keys := []Any(nil)
+	if t.base.watcherKeysEnabled() && out[t.key] != nil {
+		keys = []Any{out[t.key]}
+	}
+	data.EmitMutation(t.base.inst.Name, t.source, data.MutationInsert, 1, out[t.key], keys, out, nil)
 	t.base.setError(nil)
 	return out
 }
@@ -1452,7 +1466,12 @@ func (t *mongoTable) InsertMany(items []Map) []Map {
 		out = append(out, m)
 	}
 	data.TouchTableCache(t.base.inst.Name, t.source)
-	data.EmitMutation(t.base.inst.Name, t.source, data.MutationInsert, int64(len(out)), nil, nil, nil)
+	keys := t.collectKeys(out)
+	var key Any
+	if len(keys) > 0 {
+		key = keys[0]
+	}
+	data.EmitMutation(t.base.inst.Name, t.source, data.MutationInsert, int64(len(out)), key, keys, nil, nil)
 	t.base.setError(nil)
 	return out
 }
@@ -1478,7 +1497,11 @@ func (t *mongoTable) Upsert(dataIn Map, args ...Any) Map {
 	if len(filter) == 0 {
 		out := t.Insert(dataIn)
 		if t.base.Error() == nil && out != nil {
-			data.EmitMutation(t.base.inst.Name, t.source, data.MutationUpsert, 1, out[t.key], nil, filter)
+			keys := []Any(nil)
+			if t.base.watcherKeysEnabled() && out[t.key] != nil {
+				keys = []Any{out[t.key]}
+			}
+			data.EmitMutation(t.base.inst.Name, t.source, data.MutationUpsert, 1, out[t.key], keys, nil, filter)
 		}
 		return out
 	}
@@ -1492,8 +1515,13 @@ func (t *mongoTable) Upsert(dataIn Map, args ...Any) Map {
 		return nil
 	}
 	data.TouchTableCache(t.base.inst.Name, t.source)
-	data.EmitMutation(t.base.inst.Name, t.source, data.MutationUpsert, 1, nil, nil, filter)
 	out := t.First(filter)
+	keys := t.collectKeys([]Map{out})
+	var key Any
+	if len(keys) > 0 {
+		key = keys[0]
+	}
+	data.EmitMutation(t.base.inst.Name, t.source, data.MutationUpsert, 1, key, keys, nil, filter)
 	return out
 }
 
@@ -1533,7 +1561,11 @@ func (t *mongoTable) Change(item Map, dataIn Map) Map {
 		return nil
 	}
 	data.TouchTableCache(t.base.inst.Name, t.source)
-	data.EmitMutation(t.base.inst.Name, t.source, data.MutationUpdate, 1, item[t.key], payload, Map{t.key: item[t.key]})
+	keys := []Any(nil)
+	if t.base.watcherKeysEnabled() && item[t.key] != nil {
+		keys = []Any{item[t.key]}
+	}
+	data.EmitMutation(t.base.inst.Name, t.source, data.MutationUpdate, 1, item[t.key], keys, payload, Map{t.key: item[t.key]})
 	return t.First(Map{t.key: item[t.key]})
 }
 
@@ -1554,12 +1586,48 @@ func (t *mongoTable) Remove(args ...Any) Map {
 		return nil
 	}
 	data.TouchTableCache(t.base.inst.Name, t.source)
-	data.EmitMutation(t.base.inst.Name, t.source, data.MutationDelete, 1, item[t.key], nil, Map{t.key: item[t.key]})
+	keys := []Any(nil)
+	if t.base.watcherKeysEnabled() && item[t.key] != nil {
+		keys = []Any{item[t.key]}
+	}
+	data.EmitMutation(t.base.inst.Name, t.source, data.MutationDelete, 1, item[t.key], keys, nil, Map{t.key: item[t.key]})
 	t.base.setError(nil)
 	return item
 }
 
 func (t *mongoTable) Update(sets Map, args ...Any) int64 {
+	if err := t.base.ensureWritable(t.name + ".update"); err != nil {
+		t.base.setError(err)
+		return 0
+	}
+	args = t.singleMutationArgs(args...)
+	q, err := data.Parse(args...)
+	if err != nil {
+		t.base.setError(err)
+		return 0
+	}
+	q = t.base.mapQueryToStorage(q)
+	q = t.ensureSingleMutationQuery(q)
+	items, err := (*mongoView)(t).queryWithQuery(q)
+	if err != nil {
+		t.base.setError(err)
+		return 0
+	}
+	if len(items) == 0 {
+		t.base.setError(nil)
+		return 0
+	}
+	if out := t.Change(items[0], sets); out == nil {
+		if t.base.Error() != nil {
+			return 0
+		}
+		return 0
+	}
+	t.base.setError(nil)
+	return 1
+}
+
+func (t *mongoTable) UpdateMany(sets Map, args ...Any) int64 {
 	if err := t.base.ensureWritable(t.name + ".update"); err != nil {
 		t.base.setError(err)
 		return 0
@@ -1570,6 +1638,12 @@ func (t *mongoTable) Update(sets Map, args ...Any) int64 {
 		return 0
 	}
 	q = t.base.mapQueryToStorage(q)
+	keys, keyErr := t.mutationKeysForQuery(q, t.base.watcherKeysEnabled())
+	if keyErr != nil {
+		t.base.setError(keyErr)
+		return 0
+	}
+	where := t.queryArgsMap(args...)
 	filter, err := exprToFilter(q.Filter)
 	if err != nil {
 		t.base.setError(err)
@@ -1584,12 +1658,62 @@ func (t *mongoTable) Update(sets Map, args ...Any) int64 {
 		return 0
 	}
 	data.TouchTableCache(t.base.inst.Name, t.source)
-	data.EmitMutation(t.base.inst.Name, t.source, data.MutationUpdate, res.ModifiedCount, nil, payload, nil)
+	var key Any
+	if len(keys) > 0 {
+		key = keys[0]
+	}
+	data.EmitMutation(t.base.inst.Name, t.source, data.MutationUpdate, res.ModifiedCount, key, keys, payload, where)
 	t.base.setError(nil)
 	return res.ModifiedCount
 }
 
 func (t *mongoTable) Delete(args ...Any) int64 {
+	if err := t.base.ensureWritable(t.name + ".delete"); err != nil {
+		t.base.setError(err)
+		return 0
+	}
+	args = t.singleMutationArgs(args...)
+	q, err := data.Parse(args...)
+	if err != nil {
+		t.base.setError(err)
+		return 0
+	}
+	q = t.base.mapQueryToStorage(q)
+	q = t.ensureSingleMutationQuery(q)
+	items, err := (*mongoView)(t).queryWithQuery(q)
+	if err != nil {
+		t.base.setError(err)
+		return 0
+	}
+	if len(items) == 0 {
+		t.base.setError(nil)
+		return 0
+	}
+	id := items[0][t.key]
+	if id == nil {
+		t.base.setError(fmt.Errorf("missing primary key %s", t.key))
+		return 0
+	}
+	ctx, cancel := t.base.opContext(10 * time.Second)
+	defer cancel()
+	res, err := t.coll().DeleteOne(ctx, bson.M{t.base.storageField(t.key): id})
+	if err != nil {
+		t.base.setError(err)
+		return 0
+	}
+	if res.DeletedCount > 0 {
+		data.TouchTableCache(t.base.inst.Name, t.source)
+		keys := []Any(nil)
+		if t.base.watcherKeysEnabled() && id != nil {
+			keys = []Any{id}
+		}
+		data.EmitMutation(t.base.inst.Name, t.source, data.MutationDelete, res.DeletedCount, id, keys, nil, Map{t.key: id})
+	}
+	t.base.setError(nil)
+	return res.DeletedCount
+}
+
+func (t *mongoTable) DeleteMany(args ...Any) int64 {
 	if err := t.base.ensureWritable(t.name + ".delete"); err != nil {
 		t.base.setError(err)
 		return 0
@@ -1600,6 +1724,12 @@ func (t *mongoTable) Delete(args ...Any) int64 {
 		return 0
 	}
 	q = t.base.mapQueryToStorage(q)
+	keys, keyErr := t.mutationKeysForQuery(q, t.base.watcherKeysEnabled())
+	if keyErr != nil {
+		t.base.setError(keyErr)
+		return 0
+	}
+	where := t.queryArgsMap(args...)
 	filter, err := exprToFilter(q.Filter)
 	if err != nil {
 		t.base.setError(err)
@@ -1613,7 +1743,11 @@ func (t *mongoTable) Delete(args ...Any) int64 {
 		return 0
 	}
 	data.TouchTableCache(t.base.inst.Name, t.source)
-	data.EmitMutation(t.base.inst.Name, t.source, data.MutationDelete, res.DeletedCount, nil, nil, nil)
+	var key Any
+	if len(keys) > 0 {
+		key = keys[0]
+	}
+	data.EmitMutation(t.base.inst.Name, t.source, data.MutationDelete, res.DeletedCount, key, keys, nil, where)
 	t.base.setError(nil)
 	return res.DeletedCount
 }
@@ -1634,6 +1768,108 @@ func (t *mongoTable) Slice(offset, limit int64, args ...Any) (int64, []Map) {
 }
 func (t *mongoTable) Group(field string, args ...Any) []Map {
 	return (*mongoView)(t).Group(field, args...)
+}
+
+func (t *mongoTable) ensureSingleMutationQuery(q data.Query) data.Query {
+	if len(q.Sort) == 0 {
+		key := strings.TrimSpace(t.base.storageField(t.key))
+		if key != "" {
+			q.Sort = []data.Sort{{Field: key}}
+		}
+	}
+	q.Offset = 0
+	q.Limit = 1
+	return q
+}
+
+func (t *mongoTable) mutationKeysForQuery(q data.Query, enabled bool) ([]Any, error) {
+	if !enabled {
+		return nil, nil
+	}
+	qq := q
+	qq.Select = []string{t.key}
+	qq.Offset = 0
+	if len(qq.Sort) == 0 {
+		key := strings.TrimSpace(t.base.storageField(t.key))
+		if key != "" {
+			qq.Sort = []data.Sort{{Field: key}}
+		}
+	}
+	qq.Limit = 0
+	items, err := (*mongoView)(t).queryWithQuery(qq)
+	if err != nil {
+		return nil, err
+	}
+	keys := make([]Any, 0, len(items))
+	for _, item := range items {
+		if item == nil {
+			continue
+		}
+		if id, ok := item[t.key]; ok && id != nil {
+			keys = append(keys, id)
+		}
+	}
+	return keys, nil
+}
+
+func (t *mongoTable) queryArgsMap(args ...Any) Map {
+	where := Map{}
+	for _, arg := range args {
+		m, ok := arg.(Map)
+		if !ok {
+			continue
+		}
+		for k, v := range m {
+			where[k] = v
+		}
+	}
+	return where
+}
+
+func (t *mongoTable) collectKeys(items []Map) []Any {
+	if !t.base.watcherKeysEnabled() {
+		return nil
+	}
+	keys := make([]Any, 0, len(items))
+	for _, item := range items {
+		if item == nil {
+			continue
+		}
+		if id, ok := item[t.key]; ok && id != nil {
+			keys = append(keys, id)
+		}
+	}
+	return keys
+}
+
+func (t *mongoTable) singleMutationArgs(args ...Any) []Any {
+	id, ok := t.pickPrimaryValue(args...)
+	if !ok {
+		return args
+	}
+	return []Any{Map{t.key: id}}
+}
+
+func (t *mongoTable) pickPrimaryValue(args ...Any) (Any, bool) {
+	if len(args) == 0 {
+		return nil, false
+	}
+	storageKey := t.base.storageField(t.key)
+	for _, arg := range args {
+		m, ok := arg.(Map)
+		if !ok || len(m) == 0 {
+			continue
+		}
+		if v, ok := m[t.key]; ok && v != nil {
+			return v, true
+		}
+		if storageKey != t.key {
+			if v, ok := m[storageKey]; ok && v != nil {
+				return v, true
+			}
+		}
+	}
+	return nil, false
 }
 
 func (t *mongoTable) withAutoUpdateStamp(input Map) Map {
