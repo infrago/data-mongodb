@@ -3,9 +3,9 @@ module github.com/infrago/data-mongodb
 go 1.25.3
 
 require (
-	github.com/infrago/base v0.10.0
-	github.com/infrago/data v0.10.0
-	github.com/infrago/infra v0.10.0
+	github.com/infrago/base v0.11.0
+	github.com/infrago/data v0.11.0
+	github.com/infrago/infra v0.11.0
 	go.mongodb.org/mongo-driver v1.17.6
 )
 
@@ -23,7 +23,3 @@ require (
 	golang.org/x/text v0.28.0 // indirect
 	gopkg.in/yaml.v3 v3.0.1 // indirect
 )
-
-replace github.com/infrago/infra => ../bamgoo
-
-replace github.com/infrago/data => ../data
