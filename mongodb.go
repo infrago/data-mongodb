@@ -1542,7 +1542,7 @@ func (t *mongoTable) UpsertMany(items []Map, args ...Any) []Map {
 	return out
 }
 
-func (t *mongoTable) Change(item Map, dataIn Map) Map {
+func (t *mongoTable) updateEntity(item Map, dataIn Map) Map {
 	if err := t.base.ensureWritable(t.name + ".change"); err != nil {
 		t.base.setError(err)
 		return nil
@@ -1569,62 +1569,37 @@ func (t *mongoTable) Change(item Map, dataIn Map) Map {
 	return t.First(Map{t.key: item[t.key]})
 }
 
-func (t *mongoTable) Remove(args ...Any) Map {
-	if err := t.base.ensureWritable(t.name + ".remove"); err != nil {
-		t.base.setError(err)
-		return nil
-	}
-	item := t.First(args...)
-	if t.base.Error() != nil || item == nil {
-		return nil
-	}
-	ctx, cancel := t.base.opContext(10 * time.Second)
-	defer cancel()
-	_, err := t.coll().DeleteOne(ctx, bson.M{t.base.storageField(t.key): item[t.key]})
-	if err != nil {
-		t.base.setError(err)
-		return nil
-	}
-	data.TouchTableCache(t.base.inst.Name, t.source)
-	keys := []Any(nil)
-	if t.base.watcherKeysEnabled() && item[t.key] != nil {
-		keys = []Any{item[t.key]}
-	}
-	data.EmitMutation(t.base.inst.Name, t.source, data.MutationDelete, 1, item[t.key], keys, nil, Map{t.key: item[t.key]})
-	t.base.setError(nil)
-	return item
-}
-
-func (t *mongoTable) Update(sets Map, args ...Any) int64 {
+func (t *mongoTable) Update(sets Map, args ...Any) Map {
 	if err := t.base.ensureWritable(t.name + ".update"); err != nil {
 		t.base.setError(err)
-		return 0
+		return nil
 	}
 	args = t.singleMutationArgs(args...)
 	q, err := data.Parse(args...)
 	if err != nil {
 		t.base.setError(err)
-		return 0
+		return nil
 	}
 	q = t.base.mapQueryToStorage(q)
 	q = t.ensureSingleMutationQuery(q)
 	items, err := (*mongoView)(t).queryWithQuery(q)
 	if err != nil {
 		t.base.setError(err)
-		return 0
+		return nil
 	}
 	if len(items) == 0 {
 		t.base.setError(nil)
-		return 0
+		return nil
 	}
-	if out := t.Change(items[0], sets); out == nil {
+	if out := t.updateEntity(items[0], sets); out == nil {
 		if t.base.Error() != nil {
-			return 0
+			return nil
 		}
-		return 0
+		return nil
+	} else {
+		t.base.setError(nil)
+		return out
 	}
-	t.base.setError(nil)
-	return 1
 }
 
 func (t *mongoTable) UpdateMany(sets Map, args ...Any) int64 {
@@ -1667,39 +1642,39 @@ func (t *mongoTable) UpdateMany(sets Map, args ...Any) int64 {
 	return res.ModifiedCount
 }
 
-func (t *mongoTable) Delete(args ...Any) int64 {
+func (t *mongoTable) Delete(args ...Any) Map {
 	if err := t.base.ensureWritable(t.name + ".delete"); err != nil {
 		t.base.setError(err)
-		return 0
+		return nil
 	}
 	args = t.singleMutationArgs(args...)
 	q, err := data.Parse(args...)
 	if err != nil {
 		t.base.setError(err)
-		return 0
+		return nil
 	}
 	q = t.base.mapQueryToStorage(q)
 	q = t.ensureSingleMutationQuery(q)
 	items, err := (*mongoView)(t).queryWithQuery(q)
 	if err != nil {
 		t.base.setError(err)
-		return 0
+		return nil
 	}
 	if len(items) == 0 {
 		t.base.setError(nil)
-		return 0
+		return nil
 	}
 	id := items[0][t.key]
 	if id == nil {
 		t.base.setError(fmt.Errorf("missing primary key %s", t.key))
-		return 0
+		return nil
 	}
 	ctx, cancel := t.base.opContext(10 * time.Second)
 	defer cancel()
 	res, err := t.coll().DeleteOne(ctx, bson.M{t.base.storageField(t.key): id})
 	if err != nil {
 		t.base.setError(err)
-		return 0
+		return nil
 	}
 	if res.DeletedCount > 0 {
 		data.TouchTableCache(t.base.inst.Name, t.source)
@@ -1710,7 +1685,10 @@ func (t *mongoTable) Delete(args ...Any) int64 {
 		data.EmitMutation(t.base.inst.Name, t.source, data.MutationDelete, res.DeletedCount, id, keys, nil, Map{t.key: id})
 	}
 	t.base.setError(nil)
-	return res.DeletedCount
+	if res.DeletedCount == 0 {
+		return nil
+	}
+	return items[0]
 }
 
 func (t *mongoTable) DeleteMany(args ...Any) int64 {
