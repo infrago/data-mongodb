@@ -9,7 +9,6 @@ require (
 	go.mongodb.org/mongo-driver v1.17.6
 )
 
-replace github.com/infrago/data => ../data
 
 require (
 	github.com/golang/snappy v0.0.4 // indirect
