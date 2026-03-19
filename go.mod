@@ -3,9 +3,9 @@ module github.com/infrago/data-mongodb
 go 1.25.3
 
 require (
-	github.com/infrago/base v0.12.0
-	github.com/infrago/data v0.12.0
-	github.com/infrago/infra v0.12.0
+	github.com/infrago/base v0.14.0
+	github.com/infrago/data v0.14.0
+	github.com/infrago/infra v0.14.0
 	go.mongodb.org/mongo-driver v1.17.6
 )
 
