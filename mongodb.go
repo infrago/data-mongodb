@@ -29,15 +29,16 @@ type (
 	}
 
 	mongoBase struct {
-		inst  *data.Instance
-		conn  *mongodbConnection
-		mutex sync.RWMutex
-		err   error
-		mode  string
-		ctx   context.Context
-		tmo   time.Duration
-		txCtx mongo.SessionContext
-		txSes mongo.Session
+		inst   *data.Instance
+		conn   *mongodbConnection
+		mutex  sync.RWMutex
+		err    error
+		mode   string
+		ctx    context.Context
+		tmo    time.Duration
+		txCtx  mongo.SessionContext
+		txSes  mongo.Session
+		txDone context.CancelFunc
 	}
 
 	mongoTable struct {
@@ -341,8 +342,10 @@ func (b *mongoBase) Begin() error {
 		b.setError(err)
 		return err
 	}
-	sc := mongo.NewSessionContext(context.Background(), ses)
+	ctx, cancel := b.txRootContext(10 * time.Second)
+	sc := mongo.NewSessionContext(ctx, ses)
 	if err := sc.StartTransaction(); err != nil {
+		cancel()
 		ses.EndSession(context.Background())
 		b.setError(err)
 		return err
@@ -350,6 +353,7 @@ func (b *mongoBase) Begin() error {
 	b.mutex.Lock()
 	b.txSes = ses
 	b.txCtx = sc
+	b.txDone = cancel
 	b.mutex.Unlock()
 	b.setError(nil)
 	return nil
@@ -368,7 +372,12 @@ func (b *mongoBase) Commit() error {
 	b.mutex.Lock()
 	b.txCtx = nil
 	b.txSes = nil
+	done := b.txDone
+	b.txDone = nil
 	b.mutex.Unlock()
+	if done != nil {
+		done()
+	}
 	b.setError(err)
 	return err
 }
@@ -386,7 +395,12 @@ func (b *mongoBase) Rollback() error {
 	b.mutex.Lock()
 	b.txCtx = nil
 	b.txSes = nil
+	done := b.txDone
+	b.txDone = nil
 	b.mutex.Unlock()
+	if done != nil {
+		done()
+	}
 	b.setError(err)
 	return err
 }
@@ -414,10 +428,13 @@ func (b *mongoBase) Tx(fn data.TxFunc) error {
 		return err
 	}
 	defer ses.EndSession(context.Background())
-	_, err = ses.WithTransaction(context.Background(), func(sc mongo.SessionContext) (interface{}, error) {
+	ctx, cancel := b.txRootContext(10 * time.Second)
+	defer cancel()
+	_, err = ses.WithTransaction(ctx, func(sc mongo.SessionContext) (interface{}, error) {
 		b.mutex.Lock()
 		b.txSes = ses
 		b.txCtx = sc
+		b.txDone = nil
 		b.mutex.Unlock()
 		b.setError(nil)
 		if err := fn(b); err != nil {
@@ -431,6 +448,7 @@ func (b *mongoBase) Tx(fn data.TxFunc) error {
 	b.mutex.Lock()
 	b.txSes = nil
 	b.txCtx = nil
+	b.txDone = nil
 	b.mutex.Unlock()
 	b.setError(err)
 	return err
@@ -472,6 +490,97 @@ func (b *mongoBase) opContext(timeout time.Duration) (context.Context, context.C
 	}
 	if tmo > 0 {
 		timeout = tmo
+	}
+	if timeout > 0 {
+		return context.WithTimeout(base, timeout)
+	}
+	return base, func() {}
+}
+
+func normalizeMongoTrashOptions(in data.TrashOptions) data.TrashOptions {
+	out := in
+	if strings.TrimSpace(out.Field) == "" {
+		out.Field = "status"
+	}
+	if strings.TrimSpace(out.Value) == "" {
+		out.Value = "removed"
+	}
+	if strings.TrimSpace(out.Cascade) == "" {
+		out.Cascade = "{parent}.removed"
+	}
+	return out
+}
+
+func (b *mongoBase) trashOptions() data.TrashOptions {
+	if b == nil || b.inst == nil {
+		return normalizeMongoTrashOptions(data.TrashOptions{})
+	}
+	return normalizeMongoTrashOptions(b.inst.Config.Trash)
+}
+
+func (b *mongoBase) trashEnabled() bool {
+	return b != nil && b.inst != nil && b.inst.Config.Trash.Enable
+}
+
+func (b *mongoBase) trashField() string {
+	return b.trashOptions().Field
+}
+
+func (b *mongoBase) trashValue() string {
+	return b.trashOptions().Value
+}
+
+func mongoTrashParentName(name string) string {
+	name = strings.TrimSpace(strings.ToLower(name))
+	if name == "" {
+		return ""
+	}
+	if i := strings.LastIndex(name, "."); i >= 0 && i+1 < len(name) {
+		return name[i+1:]
+	}
+	return name
+}
+
+func (b *mongoBase) trashCascadeValue(parent string) string {
+	opts := b.trashOptions()
+	parent = mongoTrashParentName(parent)
+	if parent == "" {
+		return opts.Value
+	}
+	value := strings.TrimSpace(opts.Cascade)
+	value = strings.ReplaceAll(value, "{parent}", parent)
+	if value == "" {
+		return opts.Value
+	}
+	return value
+}
+
+func mergeMongoExpr(left, right data.Expr) data.Expr {
+	if right == nil {
+		return left
+	}
+	if left == nil {
+		return right
+	}
+	if _, ok := left.(data.TrueExpr); ok {
+		return right
+	}
+	if _, ok := right.(data.TrueExpr); ok {
+		return left
+	}
+	return data.AndExpr{Items: []data.Expr{left, right}}
+}
+
+func (b *mongoBase) txRootContext(defaultTimeout time.Duration) (context.Context, context.CancelFunc) {
+	b.mutex.RLock()
+	base := b.ctx
+	timeout := b.tmo
+	b.mutex.RUnlock()
+	if base == nil {
+		base = context.Background()
+	}
+	if timeout <= 0 {
+		timeout = defaultTimeout
 	}
 	if timeout > 0 {
 		return context.WithTimeout(base, timeout)
@@ -1581,6 +1690,7 @@ func (t *mongoTable) Update(sets Map, args ...Any) Map {
 		return nil
 	}
 	q = t.base.mapQueryToStorage(q)
+	(*mongoView)(t).applyTrashScope(&q)
 	q = t.ensureSingleMutationQuery(q)
 	items, err := (*mongoView)(t).queryWithQuery(q)
 	if err != nil {
@@ -1613,6 +1723,7 @@ func (t *mongoTable) UpdateMany(sets Map, args ...Any) int64 {
 		return 0
 	}
 	q = t.base.mapQueryToStorage(q)
+	(*mongoView)(t).applyTrashScope(&q)
 	keys, keyErr := t.mutationKeysForQuery(q, t.base.watcherKeysEnabled())
 	if keyErr != nil {
 		t.base.setError(keyErr)
@@ -1642,6 +1753,186 @@ func (t *mongoTable) UpdateMany(sets Map, args ...Any) int64 {
 	return res.ModifiedCount
 }
 
+func (t *mongoTable) Remove(args ...Any) Map {
+	if err := t.base.ensureWritable(t.name + ".remove"); err != nil {
+		t.base.setError(err)
+		return nil
+	}
+	if err := t.ensureTrashEnabled("remove"); err != nil {
+		t.base.setError(err)
+		return nil
+	}
+	args = t.singleMutationArgs(args...)
+	q, err := data.Parse(args...)
+	if err != nil {
+		t.base.setError(err)
+		return nil
+	}
+	q = t.base.mapQueryToStorage(q)
+	q.Unscoped = true
+	q.Filter = mergeMongoExpr(q.Filter, data.NullExpr{Field: t.base.storageField(t.base.trashField()), Yes: true})
+	q = t.ensureSingleMutationQuery(q)
+	items, err := (*mongoView)(t).queryWithQuery(q)
+	if err != nil {
+		t.base.setError(err)
+		return nil
+	}
+	if len(items) == 0 {
+		t.base.setError(nil)
+		return nil
+	}
+	item := items[0]
+	id := item[t.key]
+	if id == nil {
+		t.base.setError(fmt.Errorf("missing primary key %s", t.key))
+		return nil
+	}
+	payload := t.withAutoUpdateStamp(Map{t.base.trashField(): t.base.trashValue()})
+	ctx, cancel := t.base.opContext(10 * time.Second)
+	defer cancel()
+	_, err = t.coll().UpdateOne(ctx, bson.M{t.base.storageField(t.key): id}, buildUpdateDoc(t.base, payload))
+	if err != nil {
+		t.base.setError(err)
+		return nil
+	}
+	out := cloneMap(item)
+	for k, v := range payload {
+		if strings.HasPrefix(k, "$") {
+			continue
+		}
+		out[k] = v
+	}
+	data.TouchTableCache(t.base.inst.Name, t.source)
+	keys := []Any(nil)
+	if t.base.watcherKeysEnabled() && id != nil {
+		keys = []Any{id}
+	}
+	data.EmitMutation(t.base.inst.Name, t.source, data.MutationUpdate, 1, id, keys, payload, Map{t.key: id})
+	t.cascadeRemoveKeys([]Any{id})
+	t.base.setError(nil)
+	return out
+}
+
+func (t *mongoTable) RemoveMany(args ...Any) int64 {
+	if err := t.base.ensureWritable(t.name + ".remove"); err != nil {
+		t.base.setError(err)
+		return 0
+	}
+	if err := t.ensureTrashEnabled("remove"); err != nil {
+		t.base.setError(err)
+		return 0
+	}
+	q, err := data.Parse(args...)
+	if err != nil {
+		t.base.setError(err)
+		return 0
+	}
+	q = t.base.mapQueryToStorage(q)
+	q.Unscoped = true
+	q.Filter = mergeMongoExpr(q.Filter, data.NullExpr{Field: t.base.storageField(t.base.trashField()), Yes: true})
+	keys, keyErr := t.mutationKeysForQuery(q, true)
+	if keyErr != nil {
+		t.base.setError(keyErr)
+		return 0
+	}
+	where := t.queryArgsMap(args...)
+	affected := t.updateManyWithQuery(Map{t.base.trashField(): t.base.trashValue()}, q, where)
+	if t.base.Error() != nil || affected == 0 {
+		return affected
+	}
+	t.cascadeRemoveKeys(keys)
+	return affected
+}
+
+func (t *mongoTable) Restore(args ...Any) Map {
+	if err := t.base.ensureWritable(t.name + ".restore"); err != nil {
+		t.base.setError(err)
+		return nil
+	}
+	if err := t.ensureTrashEnabled("restore"); err != nil {
+		t.base.setError(err)
+		return nil
+	}
+	args = t.singleMutationArgs(args...)
+	q, err := data.Parse(args...)
+	if err != nil {
+		t.base.setError(err)
+		return nil
+	}
+	q = t.base.mapQueryToStorage(q)
+	q.Unscoped = true
+	q.Filter = mergeMongoExpr(q.Filter, data.NullExpr{Field: t.base.storageField(t.base.trashField()), Yes: false})
+	q = t.ensureSingleMutationQuery(q)
+	items, err := (*mongoView)(t).queryWithQuery(q)
+	if err != nil {
+		t.base.setError(err)
+		return nil
+	}
+	if len(items) == 0 {
+		t.base.setError(nil)
+		return nil
+	}
+	item := items[0]
+	id := item[t.key]
+	if id == nil {
+		t.base.setError(fmt.Errorf("missing primary key %s", t.key))
+		return nil
+	}
+	payload := t.withAutoUpdateStamp(Map{t.base.trashField(): nil})
+	ctx, cancel := t.base.opContext(10 * time.Second)
+	defer cancel()
+	_, err = t.coll().UpdateOne(ctx, bson.M{t.base.storageField(t.key): id}, buildUpdateDoc(t.base, payload))
+	if err != nil {
+		t.base.setError(err)
+		return nil
+	}
+	data.TouchTableCache(t.base.inst.Name, t.source)
+	keys := []Any(nil)
+	if t.base.watcherKeysEnabled() && id != nil {
+		keys = []Any{id}
+	}
+	data.EmitMutation(t.base.inst.Name, t.source, data.MutationUpdate, 1, id, keys, payload, Map{t.key: id})
+	t.cascadeRestoreKeys([]Any{id})
+	out := t.First(Map{t.key: id})
+	if out == nil && t.base.Error() == nil {
+		out = cloneMap(item)
+		delete(out, t.base.trashField())
+	}
+	t.base.setError(nil)
+	return out
+}
+
+func (t *mongoTable) RestoreMany(args ...Any) int64 {
+	if err := t.base.ensureWritable(t.name + ".restore"); err != nil {
+		t.base.setError(err)
+		return 0
+	}
+	if err := t.ensureTrashEnabled("restore"); err != nil {
+		t.base.setError(err)
+		return 0
+	}
+	q, err := data.Parse(args...)
+	if err != nil {
+		t.base.setError(err)
+		return 0
+	}
+	q = t.base.mapQueryToStorage(q)
+	q.Unscoped = true
+	q.Filter = mergeMongoExpr(q.Filter, data.NullExpr{Field: t.base.storageField(t.base.trashField()), Yes: false})
+	keys, keyErr := t.mutationKeysForQuery(q, true)
+	if keyErr != nil {
+		t.base.setError(keyErr)
+		return 0
+	}
+	where := t.queryArgsMap(args...)
+	affected := t.updateManyWithQuery(Map{t.base.trashField(): nil}, q, where)
+	if t.base.Error() != nil || affected == 0 {
+		return affected
+	}
+	t.cascadeRestoreKeys(keys)
+	return affected
+}
+
 func (t *mongoTable) Delete(args ...Any) Map {
 	if err := t.base.ensureWritable(t.name + ".delete"); err != nil {
 		t.base.setError(err)
@@ -1654,6 +1945,7 @@ func (t *mongoTable) Delete(args ...Any) Map {
 		return nil
 	}
 	q = t.base.mapQueryToStorage(q)
+	(*mongoView)(t).applyTrashScope(&q)
 	q = t.ensureSingleMutationQuery(q)
 	items, err := (*mongoView)(t).queryWithQuery(q)
 	if err != nil {
@@ -1702,6 +1994,7 @@ func (t *mongoTable) DeleteMany(args ...Any) int64 {
 		return 0
 	}
 	q = t.base.mapQueryToStorage(q)
+	(*mongoView)(t).applyTrashScope(&q)
 	keys, keyErr := t.mutationKeysForQuery(q, t.base.watcherKeysEnabled())
 	if keyErr != nil {
 		t.base.setError(keyErr)
@@ -1804,6 +2097,57 @@ func (t *mongoTable) queryArgsMap(args ...Any) Map {
 	return where
 }
 
+func (t *mongoTable) trashEnabledForTable() bool {
+	if t == nil || t.base == nil || !t.base.trashEnabled() {
+		return false
+	}
+	_, ok := t.fields[t.base.trashField()]
+	return ok
+}
+
+func (t *mongoTable) ensureTrashEnabled(op string) error {
+	if t == nil || t.base == nil || t.base.inst == nil {
+		return fmt.Errorf("%s unavailable on invalid data table", op)
+	}
+	if !t.base.trashEnabled() {
+		return fmt.Errorf("%s requires data.%s.trash.enable=true", op, t.base.inst.Name)
+	}
+	if !t.trashEnabledForTable() {
+		return fmt.Errorf("%s requires trash field %q on table %s", op, t.base.trashField(), t.name)
+	}
+	return nil
+}
+
+func (t *mongoTable) cascades() ([]data.Cascade, error) {
+	cfg, ok := resolveTable(t.base.inst.Name, t.name)
+	if !ok {
+		return nil, fmt.Errorf("data table not found: %s", t.name)
+	}
+	out := make([]data.Cascade, 0, len(cfg.Cascades))
+	for _, item := range cfg.Cascades {
+		target := strings.TrimSpace(item.Table)
+		if target == "" {
+			continue
+		}
+		fk := strings.TrimSpace(item.ForeignKey)
+		if fk == "" {
+			return nil, fmt.Errorf("cascade foreignKey is required on table %s -> %s", t.name, target)
+		}
+		targetCfg, ok := resolveTable(t.base.inst.Name, target)
+		if !ok {
+			return nil, fmt.Errorf("cascade target table not found: %s", target)
+		}
+		if _, ok := targetCfg.Fields[t.base.trashField()]; !ok {
+			return nil, fmt.Errorf("cascade target %s missing trash field %s", target, t.base.trashField())
+		}
+		if _, ok := targetCfg.Fields[fk]; !ok {
+			return nil, fmt.Errorf("cascade foreignKey %s not found on table %s", fk, target)
+		}
+		out = append(out, item)
+	}
+	return out, nil
+}
+
 func (t *mongoTable) collectKeys(items []Map) []Any {
 	if !t.base.watcherKeysEnabled() {
 		return nil
@@ -1873,6 +2217,140 @@ func (t *mongoTable) withAutoUpdateStamp(input Map) Map {
 	return out
 }
 
+func (t *mongoTable) updateManyWithQuery(sets Map, q data.Query, where Map) int64 {
+	payload := t.withAutoUpdateStamp(sets)
+	if t.blockUnsafeMutation(q) {
+		t.base.setError(fmt.Errorf("unsafe update blocked, set %s=true to allow full-table update", OptUnsafe))
+		return 0
+	}
+	keys, keyErr := t.mutationKeysForQuery(q, t.base.watcherKeysEnabled())
+	if keyErr != nil {
+		t.base.setError(keyErr)
+		return 0
+	}
+	filter, err := exprToFilter(q.Filter)
+	if err != nil {
+		t.base.setError(err)
+		return 0
+	}
+	ctx, cancel := t.base.opContext(10 * time.Second)
+	defer cancel()
+	res, err := t.coll().UpdateMany(ctx, filter, buildUpdateDoc(t.base, payload))
+	if err != nil {
+		t.base.setError(err)
+		return 0
+	}
+	data.TouchTableCache(t.base.inst.Name, t.source)
+	var key Any
+	if len(keys) > 0 {
+		key = keys[0]
+	}
+	data.EmitMutation(t.base.inst.Name, t.source, data.MutationUpdate, res.ModifiedCount, key, keys, payload, where)
+	t.base.setError(nil)
+	return res.ModifiedCount
+}
+
+func (t *mongoTable) blockUnsafeMutation(q data.Query) bool {
+	if q.Unsafe {
+		return false
+	}
+	if !t.safeWriteEnabled() {
+		return false
+	}
+	if q.RawWhere != "" {
+		return false
+	}
+	_, isTrue := q.Filter.(data.TrueExpr)
+	return isTrue
+}
+
+func (t *mongoTable) safeWriteEnabled() bool {
+	if t == nil || t.base == nil || t.base.inst == nil || t.base.inst.Config.Setting == nil {
+		return true
+	}
+	raw, ok := t.base.inst.Config.Setting["safeWrite"]
+	if !ok {
+		return true
+	}
+	on, yes := parseBool(raw)
+	if yes {
+		return on
+	}
+	return true
+}
+
+func (t *mongoTable) removeManyCascade(value string, args ...Any) int64 {
+	q, err := data.Parse(args...)
+	if err != nil {
+		t.base.setError(err)
+		return 0
+	}
+	q = t.base.mapQueryToStorage(q)
+	q.Unscoped = true
+	q.Filter = mergeMongoExpr(q.Filter, data.NullExpr{Field: t.base.storageField(t.base.trashField()), Yes: true})
+	return t.updateManyWithQuery(Map{t.base.trashField(): value}, q, t.queryArgsMap(args...))
+}
+
+func (t *mongoTable) restoreManyCascade(value string, args ...Any) int64 {
+	q, err := data.Parse(args...)
+	if err != nil {
+		t.base.setError(err)
+		return 0
+	}
+	q = t.base.mapQueryToStorage(q)
+	q.Unscoped = true
+	q.Filter = mergeMongoExpr(q.Filter, data.CmpExpr{Field: t.base.storageField(t.base.trashField()), Op: OpEq, Value: value})
+	return t.updateManyWithQuery(Map{t.base.trashField(): nil}, q, t.queryArgsMap(args...))
+}
+
+func (t *mongoTable) cascadeRemoveKeys(keys []Any) {
+	if len(keys) == 0 || t.base.Error() != nil {
+		return
+	}
+	cascades, err := t.cascades()
+	if err != nil {
+		t.base.setError(err)
+		return
+	}
+	for _, item := range cascades {
+		var args []Any
+		if len(keys) == 1 {
+			args = []Any{Map{item.ForeignKey: keys[0]}}
+		} else {
+			args = []Any{Map{item.ForeignKey: Map{OpIn: keys}}}
+		}
+		child := t.base.Table(item.Table).(*mongoTable)
+		child.removeManyCascade(t.base.trashCascadeValue(t.name), args...)
+		if t.base.Error() != nil {
+			return
+		}
+	}
+}
+
+func (t *mongoTable) cascadeRestoreKeys(keys []Any) {
+	if len(keys) == 0 || t.base.Error() != nil {
+		return
+	}
+	cascades, err := t.cascades()
+	if err != nil {
+		t.base.setError(err)
+		return
+	}
+	for _, item := range cascades {
+		var args []Any
+		if len(keys) == 1 {
+			args = []Any{Map{item.ForeignKey: keys[0]}}
+		} else {
+			args = []Any{Map{item.ForeignKey: Map{OpIn: keys}}}
+		}
+		child := t.base.Table(item.Table).(*mongoTable)
+		child.restoreManyCascade(t.base.trashCascadeValue(t.name), args...)
+		if t.base.Error() != nil {
+			return
+		}
+	}
+}
+
 func (t *mongoTable) autoUpdateFieldName() string {
 	if len(t.fields) == 0 {
 		return ""
@@ -1894,6 +2372,35 @@ func (t *mongoTable) autoUpdateFieldName() string {
 
 func (v *mongoView) coll() *mongo.Collection { return v.base.conn.db.Collection(v.source) }
 
+func (v *mongoView) trashScopedField() (string, bool) {
+	if v == nil || v.base == nil || !v.base.trashEnabled() {
+		return "", false
+	}
+	field := strings.TrimSpace(v.base.trashField())
+	if field == "" {
+		return "", false
+	}
+	if _, ok := v.fields[field]; !ok {
+		return "", false
+	}
+	return v.base.storageField(field), true
+}
+
+func (v *mongoView) applyTrashScope(q *data.Query) {
+	if q == nil || q.Unscoped || q.WithDeleted {
+		return
+	}
+	field, ok := v.trashScopedField()
+	if !ok {
+		return
+	}
+	scope := data.NullExpr{Field: field, Yes: true}
+	if q.OnlyDeleted {
+		scope = data.NullExpr{Field: field, Yes: false}
+	}
+	q.Filter = mergeMongoExpr(q.Filter, scope)
+}
+
 func (v *mongoView) Count(args ...Any) int64 {
 	q, err := data.Parse(args...)
 	if err != nil {
@@ -1901,6 +2408,7 @@ func (v *mongoView) Count(args ...Any) int64 {
 		return 0
 	}
 	q = v.base.mapQueryToStorage(q)
+	v.applyTrashScope(&q)
 	if total, ok := v.loadCountCache(q); ok {
 		v.base.setError(nil)
 		return total
@@ -1930,6 +2438,7 @@ func (v *mongoView) First(args ...Any) Map {
 	}
 	q.Limit = 1
 	q = v.base.mapQueryToStorage(q)
+	v.applyTrashScope(&q)
 	items, err := v.queryWithQuery(q)
 	if err != nil {
 		v.base.setError(err)
@@ -1950,6 +2459,7 @@ func (v *mongoView) Query(args ...Any) []Map {
 		return nil
 	}
 	q = v.base.mapQueryToStorage(q)
+	v.applyTrashScope(&q)
 	items, err := v.queryWithQuery(q)
 	v.base.setError(err)
 	return items
@@ -1965,6 +2475,7 @@ func (v *mongoView) Aggregate(args ...Any) []Map {
 		q.Aggs = []data.Agg{{Alias: "$count", Op: "count", Field: "*"}}
 	}
 	q = v.base.mapQueryToStorage(q)
+	v.applyTrashScope(&q)
 	items, err := v.aggregateWithQuery(q)
 	v.base.setError(err)
 	return items
@@ -1984,6 +2495,7 @@ func (v *mongoView) ScanN(limit int64, next data.ScanFunc, args ...Any) Res {
 		return nil
 	}
 	q = v.base.mapQueryToStorage(q)
+	v.applyTrashScope(&q)
 	if limit > 0 {
 		q.Limit = limit
 	}
@@ -2047,6 +2559,7 @@ func (v *mongoView) Slice(offset, limit int64, args ...Any) (int64, []Map) {
 		return 0, nil
 	}
 	q = v.base.mapQueryToStorage(q)
+	v.applyTrashScope(&q)
 	q.Offset = offset
 	q.Limit = limit
 	if len(q.Sort) == 0 {
@@ -2081,6 +2594,7 @@ func (v *mongoView) Group(field string, args ...Any) []Map {
 		q.Aggs = []data.Agg{{Alias: "$count", Op: "count", Field: "*"}}
 	}
 	q = v.base.mapQueryToStorage(q)
+	v.applyTrashScope(&q)
 	items, err := v.aggregateWithQuery(q)
 	v.base.setError(err)
 	return items
