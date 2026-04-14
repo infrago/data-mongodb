@@ -70,6 +70,9 @@ type mongoCacheValue struct {
 
 var mongoCacheRegistry sync.Map
 var mongoCacheCount sync.Map
+var mongoSequenceStoreReady sync.Map
+
+const mongoSequenceCollection = "_infrago_sequences"
 
 func (b *mongoBase) fieldMappingEnabled() bool {
 	return b != nil && b.inst != nil && b.inst.Config.Mapping
@@ -476,6 +479,91 @@ func (b *mongoBase) Error() error {
 	return err
 }
 func (b *mongoBase) ClearError() { b.setError(nil) }
+
+func (b *mongoBase) Sequence(key string, offset, step int64) (int64, error) {
+	items, err := b.SequenceMany(key, 1, offset, step)
+	if err != nil {
+		return 0, err
+	}
+	if len(items) == 0 {
+		return 0, nil
+	}
+	return items[0], nil
+}
+
+func (b *mongoBase) SequenceMany(key string, count, offset, step int64) ([]int64, error) {
+	if err := b.ensureWritable("sequence"); err != nil {
+		b.setError(err)
+		return nil, err
+	}
+
+	key = strings.TrimSpace(key)
+	if key == "" {
+		err := data.Error("sequence", data.ErrInvalidSequence, fmt.Errorf("sequence key is empty"))
+		b.setError(err)
+		return nil, err
+	}
+	if count <= 0 {
+		err := data.Error("sequence", data.ErrInvalidSequence, fmt.Errorf("invalid sequence count: %d", count))
+		b.setError(err)
+		return nil, err
+	}
+	if step == 0 {
+		step = 1
+	}
+
+	if err := b.ensureSequenceCollection(); err != nil {
+		b.setError(err)
+		return nil, err
+	}
+
+	ctx, cancel := b.opContext(10 * time.Second)
+	defer cancel()
+
+	coll := b.conn.db.Collection(mongoSequenceCollection)
+	now := time.Now().Unix()
+	initialLast := offset + (count-1)*step
+	delta := count * step
+
+	_, err := coll.InsertOne(ctx, bson.M{
+		"_id":        key,
+		"value":      initialLast,
+		"updated_at": now,
+	})
+	if err == nil {
+		items := dataSequenceItemsFromStart(offset, count, step)
+		b.setError(nil)
+		return items, nil
+	}
+	if !mongo.IsDuplicateKeyError(err) {
+		err = data.Error("sequence.insert", data.ErrDriver, err)
+		b.setError(err)
+		return nil, err
+	}
+
+	opts := options.FindOneAndUpdate().SetReturnDocument(options.After)
+	result := bson.M{}
+	err = coll.FindOneAndUpdate(ctx,
+		bson.M{"_id": key},
+		bson.M{"$inc": bson.M{"value": delta}, "$set": bson.M{"updated_at": now}},
+		opts,
+	).Decode(&result)
+	if err != nil {
+		err = data.Error("sequence.next", data.ErrDriver, err)
+		b.setError(err)
+		return nil, err
+	}
+	last, convErr := mongoSequenceInt64(result["value"])
+	if convErr != nil {
+		err = data.Error("sequence.decode", data.ErrDriver, convErr)
+		b.setError(err)
+		return nil, err
+	}
+	items := dataSequenceItemsFromLast(last, count, step)
+	b.setError(nil)
+	return items, nil
+}
+
 func (b *mongoBase) opContext(timeout time.Duration) (context.Context, context.CancelFunc) {
 	b.mutex.RLock()
 	sc := b.txCtx
@@ -1334,6 +1422,59 @@ func (b *mongoBase) ensureCollection(ctx context.Context, name string) error {
 		return nil
 	}
 	return b.conn.db.CreateCollection(ctx, name)
+}
+
+func (b *mongoBase) ensureSequenceCollection() error {
+	if b == nil || b.inst == nil || b.conn == nil || b.conn.db == nil {
+		return data.Error("sequence.ensure", data.ErrDriver, fmt.Errorf("invalid mongodb connection"))
+	}
+
+	cacheKey := strings.TrimSpace(strings.ToLower(b.inst.Name))
+	if _, ok := mongoSequenceStoreReady.Load(cacheKey); ok {
+		return nil
+	}
+
+	ctx, cancel := b.txRootContext(10 * time.Second)
+	defer cancel()
+
+	if err := b.ensureCollection(ctx, mongoSequenceCollection); err != nil {
+		msg := strings.ToLower(err.Error())
+		if !strings.Contains(msg, "already exists") && !strings.Contains(msg, "namespaceexists") {
+			return data.Error("sequence.ensure", data.ErrDriver, err)
+		}
+	}
+	mongoSequenceStoreReady.Store(cacheKey, struct{}{})
+	return nil
+}
+
+func mongoSequenceInt64(v Any) (int64, error) {
+	switch vv := v.(type) {
+	case int:
+		return int64(vv), nil
+	case int32:
+		return int64(vv), nil
+	case int64:
+		return vv, nil
+	case float64:
+		return int64(vv), nil
+	default:
+		return 0, fmt.Errorf("invalid sequence value: %T", v)
+	}
+}
+
+func dataSequenceItemsFromStart(start, count, step int64) []int64 {
+	items := make([]int64, 0, int(count))
+	value := start
+	for i := int64(0); i < count; i++ {
+		items = append(items, value)
+		value += step
+	}
+	return items
+}
+
+func dataSequenceItemsFromLast(last, count, step int64) []int64 {
+	start := last - (count-1)*step
+	return dataSequenceItemsFromStart(start, count, step)
 }
 
 func (b *mongoBase) ensureIndexes(ctx context.Context, source string, table data.Table) error {
