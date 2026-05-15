@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"sort"
 	"strings"
@@ -13,6 +14,7 @@ import (
 
 	. "github.com/infrago/base"
 	"github.com/infrago/data"
+	"github.com/infrago/infra"
 	"go.mongodb.org/mongo-driver/bson"
 	"go.mongodb.org/mongo-driver/bson/primitive"
 	"go.mongodb.org/mongo-driver/mongo"
@@ -411,28 +413,60 @@ func (b *mongoBase) Rollback() error {
 func (b *mongoBase) Close() error {
 	return b.Rollback()
 }
-func (b *mongoBase) Tx(fn data.TxFunc) error {
-	if fn == nil {
+
+func txNormalize(res Res) Res {
+	if res == nil {
+		return infra.OK
+	}
+	return res
+}
+
+func txResError(res Res) error {
+	if res == nil || !res.Fail() {
 		return nil
+	}
+	if err, ok := res.(error); ok {
+		return err
+	}
+	return errors.New(res.Error())
+}
+
+func txErrRes(err error) Res {
+	if err == nil {
+		return infra.OK
+	}
+	if res, ok := err.(Res); ok {
+		return res
+	}
+	return infra.Fail.With(err.Error())
+}
+
+func (b *mongoBase) Tx(fn data.TxFunc) Res {
+	if fn == nil {
+		return infra.OK
 	}
 	b.mutex.RLock()
 	hasTx := b.txCtx != nil
 	b.mutex.RUnlock()
 	if hasTx {
-		if err := fn(b); err != nil {
-			b.setError(err)
-			return err
+		res := txNormalize(fn(b))
+		if res.Fail() {
+			return res
 		}
-		return b.Error()
+		if err := b.Error(); err != nil {
+			return txErrRes(err)
+		}
+		return infra.OK
 	}
 	ses, err := b.conn.client.StartSession()
 	if err != nil {
 		b.setError(err)
-		return err
+		return txErrRes(err)
 	}
 	defer ses.EndSession(context.Background())
 	ctx, cancel := b.txRootContext(10 * time.Second)
 	defer cancel()
+	var final Res = infra.OK
 	_, err = ses.WithTransaction(ctx, func(sc mongo.SessionContext) (interface{}, error) {
 		b.mutex.Lock()
 		b.txSes = ses
@@ -440,11 +474,14 @@ func (b *mongoBase) Tx(fn data.TxFunc) error {
 		b.txDone = nil
 		b.mutex.Unlock()
 		b.setError(nil)
-		if err := fn(b); err != nil {
-			return nil, err
+		res := txNormalize(fn(b))
+		if res.Fail() {
+			final = res
+			return nil, txResError(res)
 		}
-		if b.Error() != nil {
-			return nil, b.Error()
+		if err := b.Error(); err != nil {
+			final = txErrRes(err)
+			return nil, err
 		}
 		return nil, nil
 	})
@@ -454,10 +491,13 @@ func (b *mongoBase) Tx(fn data.TxFunc) error {
 	b.txDone = nil
 	b.mutex.Unlock()
 	b.setError(err)
-	return err
+	if final.Fail() {
+		return final
+	}
+	return txErrRes(err)
 }
 
-func (b *mongoBase) TxReadOnly(fn data.TxFunc) error {
+func (b *mongoBase) TxReadOnly(fn data.TxFunc) Res {
 	return b.Tx(fn)
 }
 func (b *mongoBase) setError(err error) {
@@ -1230,8 +1270,8 @@ func (b *mongoBase) runVersionedUp(versions ...string) error {
 		if mg.Up == nil {
 			return fmt.Errorf("migration up not defined: %s", mg.Version)
 		}
-		if err := b.Tx(func(tx data.DataBase) error { return mg.Up(tx) }); err != nil {
-			return err
+		if res := b.Tx(func(tx data.DataBase) Res { return txErrRes(mg.Up(tx)) }); res.Fail() {
+			return txResError(res)
 		}
 		if err := b.markVersionApplied(mg); err != nil {
 			return err
@@ -1283,8 +1323,8 @@ func (b *mongoBase) runVersionedDown(steps int) error {
 		if mg.Down == nil {
 			return fmt.Errorf("migration down not defined: %s", v)
 		}
-		if err := b.Tx(func(tx data.DataBase) error { return mg.Down(tx) }); err != nil {
-			return err
+		if res := b.Tx(func(tx data.DataBase) Res { return txErrRes(mg.Down(tx)) }); res.Fail() {
+			return txResError(res)
 		}
 		if err := b.unmarkVersionApplied(v); err != nil {
 			return err
