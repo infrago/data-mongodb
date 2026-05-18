@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -84,10 +85,53 @@ func (b *mongoBase) watcherKeysEnabled() bool {
 	if b == nil || b.inst == nil || b.inst.Config.Watcher == nil {
 		return false
 	}
-	if v, ok := parseBool(b.inst.Config.Watcher["keys"]); ok {
+	raw := b.inst.Config.Watcher["keys"]
+	if vv, ok := raw.(Map); ok {
+		if v, ok := parseBool(vv["enable"]); ok {
+			return v
+		}
+		return true
+	}
+	if v, ok := parseBool(raw); ok {
 		return v
 	}
 	return false
+}
+
+func (b *mongoBase) watcherKeysBatchSize() int32 {
+	if b == nil || b.inst == nil || b.inst.Config.Watcher == nil {
+		return 0
+	}
+	vv, ok := b.inst.Config.Watcher["keys"].(Map)
+	if !ok {
+		return 0
+	}
+	for _, key := range []string{"batch", "batchSize", "size"} {
+		if raw, ok := vv[key]; ok {
+			if n, yes := parseIntAny(raw); yes && n > 0 {
+				return int32(n)
+			}
+		}
+	}
+	return 0
+}
+
+func (b *mongoBase) watcherKeysMaxKeys() int64 {
+	if b == nil || b.inst == nil || b.inst.Config.Watcher == nil {
+		return 0
+	}
+	vv, ok := b.inst.Config.Watcher["keys"].(Map)
+	if !ok {
+		return 0
+	}
+	for _, key := range []string{"max", "limit", "maxKeys"} {
+		if raw, ok := vv[key]; ok {
+			if n, yes := parseIntAny(raw); yes && n > 0 {
+				return int64(n)
+			}
+		}
+	}
+	return 0
 }
 
 func (b *mongoBase) storageField(field string) string {
@@ -115,12 +159,17 @@ func (b *mongoBase) appField(field string) string {
 }
 
 func (b *mongoBase) toStorageMap(input Map) Map {
+	return b.toStorageMapWithFields(input, nil)
+}
+
+func (b *mongoBase) toStorageMapWithFields(input Map, fields Vars) Map {
 	if input == nil || !b.fieldMappingEnabled() {
-		return input
+		return normalizeMongoWriteMap(input, fields)
 	}
 	out := Map{}
 	for k, v := range input {
-		out[b.storageField(k)] = v
+		cfg, _ := mongoLookupField(fields, k)
+		out[b.storageField(k)] = normalizeMongoWriteValue(cfg, v)
 	}
 	return out
 }
@@ -458,6 +507,11 @@ func (b *mongoBase) Tx(fn data.TxFunc) Res {
 		}
 		return infra.OK
 	}
+	if b.conn == nil || b.conn.client == nil {
+		err := data.Error("tx.begin", data.ErrDriver, fmt.Errorf("invalid mongodb connection"))
+		b.setError(err)
+		return txErrRes(err)
+	}
 	ses, err := b.conn.client.StartSession()
 	if err != nil {
 		b.setError(err)
@@ -498,13 +552,40 @@ func (b *mongoBase) Tx(fn data.TxFunc) Res {
 }
 
 func (b *mongoBase) TxReadOnly(fn data.TxFunc) Res {
-	return b.Tx(fn)
+	if fn == nil {
+		return infra.OK
+	}
+	clone := &mongoBase{
+		conn: b.conn,
+		mode: b.mode,
+		ctx:  b.ctx,
+		tmo:  b.tmo,
+		inst: &data.Instance{},
+	}
+	if b.inst != nil {
+		*clone.inst = *b.inst
+		clone.inst.Config.ReadOnly = true
+	}
+	if clone.conn == nil || clone.conn.client == nil {
+		res := txNormalize(fn(clone))
+		if res.Fail() {
+			return res
+		}
+		if err := clone.Error(); err != nil {
+			return txErrRes(err)
+		}
+		return infra.OK
+	}
+	return clone.Tx(fn)
 }
 func (b *mongoBase) setError(err error) {
 	b.mutex.Lock()
 	if err == nil && b.mode == "sticky" {
 		b.mutex.Unlock()
 		return
+	}
+	if err != nil {
+		err = classifyMongoError(err)
 	}
 	b.err = err
 	b.mutex.Unlock()
@@ -519,6 +600,64 @@ func (b *mongoBase) Error() error {
 	return err
 }
 func (b *mongoBase) ClearError() { b.setError(nil) }
+
+func classifyMongoError(err error) error {
+	if err == nil {
+		return nil
+	}
+	var de *data.DataError
+	if errors.As(err, &de) {
+		return err
+	}
+	switch {
+	case mongo.IsDuplicateKeyError(err):
+		return data.Error("mongo", data.ErrDuplicate, err)
+	case mongo.IsTimeout(err):
+		return data.Error("mongo", data.ErrTimeout, err)
+	case mongo.IsNetworkError(err):
+		return data.Error("mongo", data.ErrDriver, err)
+	case errors.Is(err, context.Canceled):
+		return data.Error("mongo", data.ErrCanceled, err)
+	case errors.Is(err, context.DeadlineExceeded):
+		return data.Error("mongo", data.ErrTimeout, err)
+	}
+	var cmd mongo.CommandError
+	if errors.As(err, &cmd) {
+		switch cmd.Code {
+		case 50:
+			return data.Error("mongo", data.ErrTimeout, err)
+		case 11000, 11001, 12582, 16460:
+			return data.Error("mongo", data.ErrDuplicate, err)
+		case 11600, 11602, 13435, 13436:
+			return data.Error("mongo", data.ErrDriver, err)
+		}
+	}
+	var we mongo.WriteException
+	if errors.As(err, &we) {
+		for _, item := range we.WriteErrors {
+			switch item.Code {
+			case 11000, 11001, 12582, 16460:
+				return data.Error("mongo", data.ErrDuplicate, err)
+			}
+		}
+		if we.WriteConcernError != nil {
+			return data.Error("mongo", data.ErrDriver, err)
+		}
+	}
+	var bwe mongo.BulkWriteException
+	if errors.As(err, &bwe) {
+		for _, item := range bwe.WriteErrors {
+			switch item.Code {
+			case 11000, 11001, 12582, 16460:
+				return data.Error("mongo", data.ErrDuplicate, err)
+			}
+		}
+		if bwe.WriteConcernError != nil {
+			return data.Error("mongo", data.ErrDriver, err)
+		}
+	}
+	return err
+}
 
 func (b *mongoBase) Sequence(key string, offset, step int64) (int64, error) {
 	items, err := b.SequenceMany(key, 1, offset, step)
@@ -1700,7 +1839,7 @@ func (t *mongoTable) Insert(dataIn Map) Map {
 	}
 	ctx, cancel := t.base.opContext(10 * time.Second)
 	defer cancel()
-	doc := bson.M(t.base.toStorageMap(dataIn))
+	doc := bson.M(t.base.toStorageMapWithFields(dataIn, t.fields))
 	res, err := t.coll().InsertOne(ctx, doc)
 	if err != nil {
 		t.base.setError(err)
@@ -1740,7 +1879,7 @@ func (t *mongoTable) InsertMany(items []Map) []Map {
 	defer cancel()
 	docs := make([]any, 0, len(items))
 	for _, item := range items {
-		docs = append(docs, bson.M(t.base.toStorageMap(item)))
+		docs = append(docs, bson.M(t.base.toStorageMapWithFields(item, t.fields)))
 	}
 	res, err := t.coll().InsertMany(ctx, docs)
 	if err != nil {
@@ -1796,7 +1935,7 @@ func (t *mongoTable) Upsert(dataIn Map, args ...Any) Map {
 		return out
 	}
 	payload := t.withAutoUpdateStamp(dataIn)
-	upd := buildUpdateDoc(t.base, payload)
+	upd := buildUpdateDocWithFields(t.base, payload, t.fields)
 	ctx, cancel := t.base.opContext(10 * time.Second)
 	defer cancel()
 	_, err := t.coll().UpdateOne(ctx, bson.M(filter), upd, options.Update().SetUpsert(true))
@@ -1842,7 +1981,7 @@ func (t *mongoTable) updateEntity(item Map, dataIn Map) Map {
 		return nil
 	}
 	payload := t.withAutoUpdateStamp(dataIn)
-	upd := buildUpdateDoc(t.base, payload)
+	upd := buildUpdateDocWithFields(t.base, payload, t.fields)
 	ctx, cancel := t.base.opContext(10 * time.Second)
 	defer cancel()
 	_, err := t.coll().UpdateOne(ctx, bson.M{t.base.storageField(t.key): item[t.key]}, upd)
@@ -1919,7 +2058,7 @@ func (t *mongoTable) UpdateMany(sets Map, args ...Any) int64 {
 	ctx, cancel := t.base.opContext(10 * time.Second)
 	defer cancel()
 	payload := t.withAutoUpdateStamp(sets)
-	res, err := t.coll().UpdateMany(ctx, filter, buildUpdateDoc(t.base, payload))
+	res, err := t.coll().UpdateMany(ctx, filter, buildUpdateDocWithFields(t.base, payload, t.fields))
 	if err != nil {
 		t.base.setError(err)
 		return 0
@@ -1971,7 +2110,7 @@ func (t *mongoTable) Remove(args ...Any) Map {
 	payload := t.withAutoUpdateStamp(Map{t.base.trashField(): t.base.trashValue()})
 	ctx, cancel := t.base.opContext(10 * time.Second)
 	defer cancel()
-	_, err = t.coll().UpdateOne(ctx, bson.M{t.base.storageField(t.key): id}, buildUpdateDoc(t.base, payload))
+	_, err = t.coll().UpdateOne(ctx, bson.M{t.base.storageField(t.key): id}, buildUpdateDocWithFields(t.base, payload, t.fields))
 	if err != nil {
 		t.base.setError(err)
 		return nil
@@ -2062,7 +2201,7 @@ func (t *mongoTable) Restore(args ...Any) Map {
 	payload := t.withAutoUpdateStamp(Map{t.base.trashField(): nil})
 	ctx, cancel := t.base.opContext(10 * time.Second)
 	defer cancel()
-	_, err = t.coll().UpdateOne(ctx, bson.M{t.base.storageField(t.key): id}, buildUpdateDoc(t.base, payload))
+	_, err = t.coll().UpdateOne(ctx, bson.M{t.base.storageField(t.key): id}, buildUpdateDocWithFields(t.base, payload, t.fields))
 	if err != nil {
 		t.base.setError(err)
 		return nil
@@ -2238,30 +2377,66 @@ func (t *mongoTable) mutationKeysForQuery(q data.Query, enabled bool) ([]Any, er
 	if !enabled {
 		return nil, nil
 	}
-	qq := q
-	qq.Select = []string{t.key}
-	qq.Offset = 0
-	if len(qq.Sort) == 0 {
-		key := strings.TrimSpace(t.base.storageField(t.key))
-		if key != "" {
-			qq.Sort = []data.Sort{{Field: key}}
-		}
+	qq := applyAfter(q)
+	key := strings.TrimSpace(t.base.storageField(t.key))
+	if key == "" {
+		return nil, nil
 	}
-	qq.Limit = 0
-	items, err := (*mongoView)(t).queryWithQuery(qq)
+	filter, err := exprToFilter(qq.Filter)
 	if err != nil {
 		return nil, err
 	}
-	keys := make([]Any, 0, len(items))
-	for _, item := range items {
-		if item == nil {
+	findOpts := options.Find().SetProjection(bson.M{key: 1})
+	if len(qq.Sort) == 0 {
+		qq.Sort = []data.Sort{{Field: key}}
+	}
+	if len(qq.Sort) > 0 {
+		sortDoc := bson.D{}
+		for _, one := range qq.Sort {
+			dir := 1
+			if one.Desc {
+				dir = -1
+			}
+			sortDoc = append(sortDoc, bson.E{Key: one.Field, Value: dir})
+		}
+		findOpts.SetSort(sortDoc)
+	}
+	if qq.Offset > 0 {
+		findOpts.SetSkip(qq.Offset)
+	}
+	if qq.Limit > 0 {
+		findOpts.SetLimit(qq.Limit)
+	}
+	if batchSize := t.base.watcherKeysBatchSize(); batchSize > 0 {
+		findOpts.SetBatchSize(batchSize)
+	}
+	maxKeys := t.base.watcherKeysMaxKeys()
+	if maxKeys > 0 && (qq.Limit <= 0 || qq.Limit > maxKeys) {
+		findOpts.SetLimit(maxKeys)
+	}
+	ctx, cancel := t.base.opContext(15 * time.Second)
+	defer cancel()
+	cur, err := t.coll().Find(ctx, filter, findOpts)
+	if err != nil {
+		return nil, err
+	}
+	defer cur.Close(ctx)
+	keys := make([]Any, 0)
+	for cur.Next(ctx) {
+		m := bson.M{}
+		if err := cur.Decode(&m); err != nil {
+			return nil, err
+		}
+		val, ok := m[key]
+		if !ok || val == nil {
 			continue
 		}
-		if id, ok := item[t.key]; ok && id != nil {
-			keys = append(keys, id)
+		keys = append(keys, normalizeBsonValue(val))
+		if maxKeys > 0 && int64(len(keys)) >= maxKeys {
+			break
 		}
 	}
-	return keys, nil
+	return keys, cur.Err()
 }
 
 func (t *mongoTable) queryArgsMap(args ...Any) Map {
@@ -2416,7 +2591,7 @@ func (t *mongoTable) updateManyWithQuery(sets Map, q data.Query, where Map) int6
 	}
 	ctx, cancel := t.base.opContext(10 * time.Second)
 	defer cancel()
-	res, err := t.coll().UpdateMany(ctx, filter, buildUpdateDoc(t.base, payload))
+	res, err := t.coll().UpdateMany(ctx, filter, buildUpdateDocWithFields(t.base, payload, t.fields))
 	if err != nil {
 		t.base.setError(err)
 		return 0
@@ -3182,6 +3357,10 @@ func cmpToFilter(c data.CmpExpr) (bson.M, error) {
 }
 
 func buildUpdateDoc(base *mongoBase, input Map) bson.M {
+	return buildUpdateDocWithFields(base, input, nil)
+}
+
+func buildUpdateDocWithFields(base *mongoBase, input Map, fields Vars) bson.M {
 	setPart := bson.M{}
 	incPart := bson.M{}
 	unsetPart := bson.M{}
@@ -3194,13 +3373,17 @@ func buildUpdateDoc(base *mongoBase, input Map) bson.M {
 		}
 		return base.storageField(name)
 	}
+	value := func(name string, v Any) Any {
+		cfg, _ := mongoLookupField(fields, name)
+		return normalizeMongoWriteValue(cfg, v)
+	}
 
 	for k, v := range input {
 		switch k {
 		case UpdSet:
 			if m, ok := v.(Map); ok {
 				for kk, vv := range m {
-					setPart[field(kk)] = vv
+					setPart[field(kk)] = value(kk, vv)
 				}
 			}
 		case UpdInc:
@@ -3231,7 +3414,7 @@ func buildUpdateDoc(base *mongoBase, input Map) bson.M {
 		case UpdPush:
 			if m, ok := v.(Map); ok {
 				for kk, vv := range m {
-					arr := toAnySlice(vv)
+					arr := normalizeMongoWriteSlice(mongoFieldElem(fields, kk), toAnySlice(vv))
 					if len(arr) > 1 {
 						pushPart[field(kk)] = bson.M{"$each": arr}
 					} else if len(arr) == 1 {
@@ -3242,7 +3425,7 @@ func buildUpdateDoc(base *mongoBase, input Map) bson.M {
 		case UpdPull:
 			if m, ok := v.(Map); ok {
 				for kk, vv := range m {
-					arr := toAnySlice(vv)
+					arr := normalizeMongoWriteSlice(mongoFieldElem(fields, kk), toAnySlice(vv))
 					if len(arr) > 1 {
 						pullPart[field(kk)] = bson.M{"$in": arr}
 					} else if len(arr) == 1 {
@@ -3253,7 +3436,7 @@ func buildUpdateDoc(base *mongoBase, input Map) bson.M {
 		case UpdAddToSet:
 			if m, ok := v.(Map); ok {
 				for kk, vv := range m {
-					arr := toAnySlice(vv)
+					arr := normalizeMongoWriteSlice(mongoFieldElem(fields, kk), toAnySlice(vv))
 					if len(arr) > 1 {
 						addSetPart[field(kk)] = bson.M{"$each": arr}
 					} else if len(arr) == 1 {
@@ -3264,7 +3447,7 @@ func buildUpdateDoc(base *mongoBase, input Map) bson.M {
 		case UpdSetPath:
 			if m, ok := v.(Map); ok {
 				for kk, vv := range m {
-					setPart[field(kk)] = vv
+					setPart[field(kk)] = value(kk, vv)
 				}
 			}
 		case UpdUnsetPath:
@@ -3284,7 +3467,7 @@ func buildUpdateDoc(base *mongoBase, input Map) bson.M {
 			}
 		default:
 			if !strings.HasPrefix(k, "$") {
-				setPart[field(k)] = v
+				setPart[field(k)] = value(k, v)
 			}
 		}
 	}
@@ -3701,6 +3884,37 @@ func parseBool(v Any) (bool, bool) {
 	return false, false
 }
 
+func parseIntAny(v Any) (int, bool) {
+	switch vv := v.(type) {
+	case int:
+		return vv, true
+	case int8:
+		return int(vv), true
+	case int16:
+		return int(vv), true
+	case int32:
+		return int(vv), true
+	case int64:
+		return int(vv), true
+	case uint:
+		return int(vv), true
+	case uint8:
+		return int(vv), true
+	case uint16:
+		return int(vv), true
+	case uint32:
+		return int(vv), true
+	case uint64:
+		return int(vv), true
+	case float64:
+		return int(vv), true
+	case string:
+		n, err := strconv.Atoi(strings.TrimSpace(vv))
+		return n, err == nil
+	}
+	return 0, false
+}
+
 func mongoErrorModeFromSetting(setting Map) string {
 	mode := "auto-clear"
 	if setting == nil {
@@ -3894,12 +4108,138 @@ func bsonToMap(m bson.M) Map {
 	return out
 }
 
+func normalizeMongoWriteMap(input Map, fields Vars) Map {
+	if input == nil {
+		return nil
+	}
+	out := Map{}
+	for k, v := range input {
+		cfg, _ := mongoLookupField(fields, k)
+		out[k] = normalizeMongoWriteValue(cfg, v)
+	}
+	return out
+}
+
+func normalizeMongoWriteValue(cfg Var, v Any) Any {
+	if v == nil {
+		return nil
+	}
+	if mongoIsObjectIDVar(cfg) {
+		return normalizeMongoObjectID(v)
+	}
+	if mongoIsDecimalVar(cfg) {
+		return normalizeMongoDecimal(v)
+	}
+	if data.IsTimeVar(cfg) {
+		if out, ok := data.BindTimeValue(v); ok {
+			return out
+		}
+	}
+	if data.IsBinaryVar(cfg) {
+		return normalizeMongoBinary(v)
+	}
+	switch vv := v.(type) {
+	case Map:
+		return normalizeMongoWriteMap(vv, cfg.Children)
+	case bson.M:
+		return bson.M(normalizeMongoWriteMap(Map(vv), cfg.Children))
+	case []Any:
+		return normalizeMongoWriteSlice(mongoElemVar(cfg), vv)
+	case []Map:
+		out := make([]Any, 0, len(vv))
+		elem := mongoElemVar(cfg)
+		for _, one := range vv {
+			out = append(out, normalizeMongoWriteValue(elem, one))
+		}
+		return out
+	case []string:
+		return normalizeMongoWriteSlice(mongoElemVar(cfg), toAnySlice(vv))
+	case []int:
+		return normalizeMongoWriteSlice(mongoElemVar(cfg), toAnySlice(vv))
+	case []int64:
+		return normalizeMongoWriteSlice(mongoElemVar(cfg), toAnySlice(vv))
+	case []float64:
+		return normalizeMongoWriteSlice(mongoElemVar(cfg), toAnySlice(vv))
+	default:
+		return v
+	}
+}
+
+func normalizeMongoWriteSlice(cfg Var, items []Any) []Any {
+	out := make([]Any, 0, len(items))
+	for _, item := range items {
+		out = append(out, normalizeMongoWriteValue(cfg, item))
+	}
+	return out
+}
+
+func normalizeMongoObjectID(v Any) Any {
+	switch vv := v.(type) {
+	case primitive.ObjectID:
+		return vv
+	case string:
+		if id, err := primitive.ObjectIDFromHex(strings.TrimSpace(vv)); err == nil {
+			return id
+		}
+	case []byte:
+		if id, err := primitive.ObjectIDFromHex(strings.TrimSpace(string(vv))); err == nil {
+			return id
+		}
+	}
+	return v
+}
+
+func normalizeMongoDecimal(v Any) Any {
+	switch vv := v.(type) {
+	case primitive.Decimal128:
+		return vv
+	case string:
+		if d, err := primitive.ParseDecimal128(strings.TrimSpace(vv)); err == nil {
+			return d
+		}
+	case []byte:
+		if d, err := primitive.ParseDecimal128(strings.TrimSpace(string(vv))); err == nil {
+			return d
+		}
+	case fmt.Stringer:
+		if d, err := primitive.ParseDecimal128(strings.TrimSpace(vv.String())); err == nil {
+			return d
+		}
+	}
+	return v
+}
+
+func normalizeMongoBinary(v Any) Any {
+	switch vv := v.(type) {
+	case primitive.Binary:
+		return vv
+	case []byte:
+		return primitive.Binary{Data: vv}
+	case string:
+		return primitive.Binary{Data: []byte(vv)}
+	default:
+		return v
+	}
+}
+
 func normalizeBsonValue(v Any) Any {
 	switch vv := v.(type) {
 	case primitive.ObjectID:
 		return vv.Hex()
+	case primitive.Decimal128:
+		return vv.String()
+	case primitive.DateTime:
+		return vv.Time()
+	case primitive.Binary:
+		return vv.Data
 	case bson.M:
 		return bsonToMap(vv)
+	case bson.D:
+		out := Map{}
+		for _, elem := range vv {
+			out[elem.Key] = normalizeBsonValue(elem.Value)
+		}
+		return out
 	case []any:
 		arr := make([]Any, 0, len(vv))
 		for _, one := range vv {
@@ -3909,6 +4249,58 @@ func normalizeBsonValue(v Any) Any {
 	default:
 		return vv
 	}
+}
+
+func mongoLookupField(fields Vars, path string) (Var, bool) {
+	if len(fields) == 0 || strings.TrimSpace(path) == "" {
+		return Nil, false
+	}
+	parts := strings.Split(path, ".")
+	item, ok := fields[parts[0]]
+	if !ok {
+		return Nil, false
+	}
+	for _, part := range parts[1:] {
+		if len(item.Children) == 0 {
+			return Nil, false
+		}
+		next, ok := item.Children[part]
+		if !ok {
+			return Nil, false
+		}
+		item = next
+	}
+	return item, true
+}
+
+func mongoElemVar(cfg Var) Var {
+	cfg.Type = strings.TrimSpace(cfg.Type)
+	if strings.HasPrefix(cfg.Type, "[]") {
+		cfg.Type = strings.TrimPrefix(cfg.Type, "[]")
+	} else if strings.HasPrefix(cfg.Type, "[") && strings.HasSuffix(cfg.Type, "]") {
+		cfg.Type = strings.TrimSuffix(strings.TrimPrefix(cfg.Type, "["), "]")
+	} else if strings.HasPrefix(strings.ToLower(cfg.Type), "array") {
+		cfg.Type = strings.TrimSpace(strings.TrimPrefix(cfg.Type, "array"))
+	}
+	return cfg
+}
+
+func mongoFieldElem(fields Vars, path string) Var {
+	cfg, ok := mongoLookupField(fields, path)
+	if !ok {
+		return Nil
+	}
+	return mongoElemVar(cfg)
+}
+
+func mongoIsObjectIDVar(cfg Var) bool {
+	kind := strings.ToLower(strings.TrimSpace(cfg.Type))
+	return kind == "oid" || kind == "objectid" || kind == "object_id"
+}
+
+func mongoIsDecimalVar(cfg Var) bool {
+	kind := strings.ToLower(strings.TrimSpace(cfg.Type))
+	return kind == "decimal" || kind == "decimal128" || kind == "numeric" || kind == "money"
 }
 
 func toAnySlice(v Any) []Any {
